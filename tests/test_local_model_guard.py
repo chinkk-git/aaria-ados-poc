@@ -7,6 +7,7 @@ class LocalModelGuardPolicyTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "python-multiprovider-executor.yml").read_text()
         self.assertIn("gh api --paginate --slurp", workflow)
+        self.assertIn("select((.id | tostring) != $current)", workflow)
         self.assertIn("repos/$GH_REPOSITORY/actions/runs/$prior_id/jobs?per_page=100", workflow)
         self.assertIn('($steps | length) == 2 and ($steps | all(. == "skipped"))', workflow)
 

@@ -9,8 +9,11 @@
   "task_prompt": "Synthetic fixture only. No external model call, provider call, or repository write.",
   "acceptance_criteria": ["The fake worker receives this manifest once."],
   "cost_ceiling_usd": 0.0,
-  "provider": "openrouter",
-  "provider_model": "openrouter/free",
+  "provider": "local",
+  "provider_model": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+  "provider_model_revision": "f86cb2c1fa58255f8052cc32aeede1b7482d4361",
+  "provider_model_sha256": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
+  "inference_authorization_id": null,
   "max_provider_calls": 1,
   "max_workflow_recoveries": 2,
   "enabled": false

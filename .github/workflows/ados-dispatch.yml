@@ -43,17 +43,16 @@ jobs:
           python3 - <<'PYSELECT'
           import glob, json, os, pathlib, re, subprocess, urllib.parse
           repo = os.environ["REPOSITORY"]
-          status = json.loads(pathlib.Path("providers/status.json").read_text())["openrouter"]
+          status = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
           try:
               import datetime, time
               status_age = time.time() - datetime.datetime.fromisoformat(status["last_verified_at"].replace("Z", "+00:00")).timestamp()
           except Exception:
               status_age = float("inf")
-          provider_ready = (status.get("model") == "openrouter/free"
+          provider_ready = (status.get("model") == "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
               and status.get("eligibility") == "VERIFIED_ZERO_COST"
-              and status.get("quota_status") == "AVAILABLE"
+              and status.get("quota_status") == "NOT_APPLICABLE"
               and status.get("cost_authorized_usd") == 0.0
-              and type(status.get("quota_remaining")) is int and status["quota_remaining"] > 0
               and 0 <= status_age <= 3600)
           if not provider_ready:
               issues = []
@@ -190,23 +189,21 @@ jobs:
                   value = str(data[key]).lower() if isinstance(data[key], bool) else str(data[key])
                   output.write(f"{key}={value}\n")
           PY
-      - name: Verify selected provider zero-cost eligibility and quota
+      - name: Verify authorized local Qwen backend before claiming
         if: steps.preflight.outputs.resume != 'true'
+        env:
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
         run: |
           set -euo pipefail
-          python3 - <<'PYPROVIDER'
-          import json, pathlib, time, datetime
-          record = json.loads(pathlib.Path("providers/status.json").read_text())["openrouter"]
-          try:
-              age = time.time() - datetime.datetime.fromisoformat(record["last_verified_at"].replace("Z", "+00:00")).timestamp()
-          except Exception:
-              raise SystemExit("BLOCKED: provider eligibility timestamp is unknown")
-          if (record.get("model") != "openrouter/free" or record.get("eligibility") != "VERIFIED_ZERO_COST"
-                  or record.get("quota_status") != "AVAILABLE" or record.get("cost_authorized_usd") != 0.0
-                  or type(record.get("quota_remaining")) is not int or record["quota_remaining"] <= 0
-                  or age < 0 or age > 3600):
-              raise SystemExit("BLOCKED: selected provider is ineligible or quota is unverified/exhausted")
-          PYPROVIDER
+          python3 - <<'PYQWEN'
+          import json, os, pathlib, sys
+          sys.path.insert(0, "scripts")
+          from ados_executor import parse_dispatch_manifest, validate_local_qwen_record
+          task = json.loads(pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text())
+          manifest = parse_dispatch_manifest(task)
+          provider = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
+          validate_local_qwen_record(provider, manifest)
+          PYQWEN
 
       - name: Persist single-use task claim
         if: steps.preflight.outputs.resume != 'true'
@@ -230,8 +227,8 @@ jobs:
 
   execute:
     needs: [candidate, authorize]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
     concurrency:
       group: ados-dispatch-branch-${{ needs.authorize.outputs.branch }}
       cancel-in-progress: false
@@ -249,97 +246,126 @@ jobs:
         with:
           name: ados-dispatch-${{ needs.authorize.outputs.event_key }}
 
-      - name: Install pinned coding executor
-        if: github.run_attempt == 1
-        run: |
-          set -euo pipefail
-          npm install --global @opencode/cli@2.2.5
-          opencode --version
-
-      - name: Run the bounded task in a credential-isolated worker job
+      - name: Revalidate local Qwen task and prepare one-file prompt
         if: github.run_attempt == 1
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
-          TASK_ID: ${{ needs.authorize.outputs.task_id }}
-          EVENT_KEY: ${{ needs.authorize.outputs.event_key }}
-        shell: bash
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          python3 - <<'PYPROVIDER'
-          import json, pathlib, time, datetime
-          record = json.loads(pathlib.Path("providers/status.json").read_text())["openrouter"]
-          try:
-              age = time.time() - datetime.datetime.fromisoformat(record["last_verified_at"].replace("Z", "+00:00")).timestamp()
-          except Exception:
-              raise SystemExit("BLOCKED: provider eligibility timestamp is unknown")
-          if (record.get("model") != "openrouter/free" or record.get("eligibility") != "VERIFIED_ZERO_COST"
-                  or record.get("quota_status") != "AVAILABLE" or record.get("cost_authorized_usd") != 0.0
-                  or type(record.get("quota_remaining")) is not int or record["quota_remaining"] <= 0
-                  or age < 0 or age > 3600):
-              raise SystemExit("BLOCKED: selected provider is ineligible or quota is unverified/exhausted")
-          PYPROVIDER
-          test -n "$OPENROUTER_API_KEY" || { echo "BLOCKED: worker credential unavailable"; exit 1; }
           python3 - <<'PY'
-          import json, os, pathlib, subprocess
-          manifest = json.loads(pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text())
-          allowed_edits = {path: "allow" for path in manifest["permitted_paths"]}
-          config = {
-              "$schema": "https://opencode.ai/config.json",
-              "permission": {
-                  "*": "deny",
-                  "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"},
-                  "glob": "allow", "grep": "allow", "edit": allowed_edits,
-                  "external_directory": "deny", "bash": "deny", "task": "deny",
-                  "webfetch": "deny", "websearch": "deny", "lsp": "deny",
-                  "todowrite": "deny"
-              }
-          }
-          pathlib.Path("opencode.json").write_text(json.dumps(config), encoding="utf-8")
-          try:
-              prompt = manifest["task_prompt"] + "\n\nAcceptance criteria:\n- " + "\n- ".join(manifest["acceptance_criteria"])
-              worker_env = {
-                  "PATH": os.environ["PATH"],
-                  "HOME": os.environ.get("HOME", ""),
-                  "LANG": os.environ.get("LANG", "C.UTF-8"),
-                  "OPENROUTER_API_KEY": os.environ["OPENROUTER_API_KEY"],
-              }
-              subprocess.run([
-                  "opencode", "run", "--standalone", "--auto", "--model",
-                  "openrouter/free", prompt
-              ], check=True, timeout=900, env=worker_env)
-          finally:
-              pathlib.Path("opencode.json").unlink(missing_ok=True)
+          import json, os, pathlib, sys
+          sys.path.insert(0, "scripts")
+          from ados_executor import (build_local_qwen_prompt, parse_dispatch_manifest,
+                                     validate_local_qwen_record)
+          manifest = parse_dispatch_manifest(json.loads(
+              pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text()))
+          provider = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
+          validate_local_qwen_record(provider, manifest)
+          if len(manifest.permitted_paths) != 1:
+              raise SystemExit("BLOCKED: local Qwen dispatcher currently accepts one-file tasks only")
+          target_path = manifest.permitted_paths[0]
+          source = pathlib.Path(target_path)
+          if source.is_symlink():
+              raise SystemExit("REJECTED: authorized base contains a symlink at the target path")
+          existing = source.read_text(encoding="utf-8") if source.exists() else ""
+          prompt = build_local_qwen_prompt(task_prompt=manifest.task_prompt,
+              acceptance_criteria=manifest.acceptance_criteria,
+              target_path=target_path, existing_content=existing)
+          prompt_file = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ados-qwen-prompt.txt"
+          prompt_file.write_text(prompt, encoding="utf-8")
+
+      - name: Build the pinned local llama.cpp runtime
+        if: github.run_attempt == 1
+        env:
+          LLAMA_CPP_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/llama.cpp"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C "$source_dir" fetch --depth 1 origin "$LLAMA_CPP_COMMIT"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$LLAMA_CPP_COMMIT"
+          test -s "$source_dir/LICENSE"
+          grep -Fq "MIT License" "$source_dir/LICENSE"
+          cmake -S "$source_dir" -B "$source_dir/build" \
+            -DGGML_CUDA=OFF -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+          cmake --build "$source_dir/build" --target llama-server -j 4
+          test -x "$source_dir/build/bin/llama-server"
+
+      - name: Verify runner capacity and pinned model metadata
+        if: github.run_attempt == 1
+        run: python3 scripts/local_model_preflight.py "$RUNNER_TEMP/qwen-preflight.json"
+
+      - name: Download the checksum-pinned Qwen model once
+        if: github.run_attempt == 1
+        run: python3 scripts/download_local_model.py "$RUNNER_TEMP/qwen-coder.gguf" "$RUNNER_TEMP/qwen-download.json"
+
+      - name: Resolve bounded output paths from the manifest
+        id: qwenpaths
+        if: github.run_attempt == 1
+        env:
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          sys.path.insert(0, "scripts")
+          from ados_executor import parse_dispatch_manifest
+          manifest = parse_dispatch_manifest(json.loads(
+              pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text()))
+          target = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ados-candidate" / manifest.permitted_paths[0]
+          target.parent.mkdir(parents=True, exist_ok=True)
+          evidence = pathlib.Path(os.environ["RUNNER_TEMP"]) / "qwen-inference.json"
+          prompt = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ados-qwen-prompt.txt"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"output_path={target}\n")
+              output.write(f"evidence_path={evidence}\n")
+              output.write(f"prompt_path={prompt}\n")
           PY
 
-      - name: Validate worker output and package only permitted files
+      - name: Make exactly one isolated local Qwen request
+        if: github.run_attempt == 1
+        env:
+          LLAMA_SERVER_BIN: ${{ runner.temp }}/llama.cpp/build/bin/llama-server
+          LLAMA_CPP_EXPECTED_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
+          OUTPUT_PATH: ${{ steps.qwenpaths.outputs.output_path }}
+          EVIDENCE_PATH: ${{ steps.qwenpaths.outputs.evidence_path }}
+          PROMPT_PATH: ${{ steps.qwenpaths.outputs.prompt_path }}
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=15s 16m python3 scripts/run_local_model_once.py \
+            "$RUNNER_TEMP/qwen-coder.gguf" "$OUTPUT_PATH" "$EVIDENCE_PATH" "$PROMPT_PATH"
+
+      - name: Validate one-file output and package only the permitted path
         if: github.run_attempt == 1
         env:
           ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
-        shell: bash
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, pathlib, subprocess, zipfile
-          from scripts.ados_executor import normalize_scope_path
-          manifest = json.loads(pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text())
-          raw = subprocess.check_output(["git", "status", "--porcelain", "-z"])
-          entries = [entry for entry in raw.decode().split("\0") if entry]
-          changed = []
-          for entry in entries:
-              status, path = entry[:2], entry[3:]
-              path = normalize_scope_path(path)
-              if status.strip() not in {"??", "M", "A"} or path not in manifest["permitted_paths"]:
-                  raise SystemExit("REJECTED: worker changed a path or file state outside its manifest")
-              target = pathlib.Path(path)
-              if target.is_symlink() or not target.is_file() or target.stat().st_size == 0:
-                  raise SystemExit("REJECTED: worker output is missing, empty, or a symlink")
-              changed.append(path)
-          if not changed:
-              raise SystemExit("REJECTED: worker produced no permitted file")
-          with zipfile.ZipFile("dispatch-output.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
-              for path in sorted(set(changed)):
-                  archive.write(path, path)
+          import json, os, pathlib, sys, zipfile
+          sys.path.insert(0, "scripts")
+          from ados_executor import parse_dispatch_manifest, validate_local_qwen_output
+          manifest = parse_dispatch_manifest(json.loads(
+              pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text()))
+          if len(manifest.permitted_paths) != 1:
+              raise SystemExit("REJECTED: expected a one-file task manifest")
+          target_path = manifest.permitted_paths[0]
+          generated = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ados-candidate" / target_path
+          if generated.is_symlink() or not generated.is_file():
+              raise SystemExit("REJECTED: generated output is missing or not a regular file")
+          contents = generated.read_text(encoding="utf-8")
+          validated = validate_local_qwen_output(returned_path=target_path,
+              expected_path=manifest.permitted_paths[0], content=contents)
+          archive_path = pathlib.Path("dispatch-output.zip")
+          with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              archive.writestr(target_path, validated)
           PY
 
       - name: Transfer validated output to the scoped writer job

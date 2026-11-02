@@ -7,12 +7,12 @@
   "required": [
     "issue_number", "authorized_actors", "repository", "task_id", "branch",
     "expected_base_sha", "permitted_paths", "task_prompt", "acceptance_criteria",
-    "cost_ceiling_usd", "provider", "provider_model", "max_provider_calls", "max_workflow_recoveries", "enabled"
+    "cost_ceiling_usd", "provider", "provider_model", "provider_model_revision", "provider_model_sha256", "inference_authorization_id", "max_provider_calls", "max_workflow_recoveries", "enabled"
   ],
   "properties": {
     "issue_number": {"type": "integer", "minimum": 1},
     "authorized_actors": {
-      "type": "array", "minItems": 1, "uniqueItems": true,
+      "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true,
       "items": {"type": "string", "pattern": "^[A-Za-z0-9-]{1,39}$"}
     },
     "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
@@ -29,8 +29,11 @@
       "items": {"type": "string", "minLength": 1, "maxLength": 1000}
     },
     "cost_ceiling_usd": {"const": 0.0},
-    "provider": {"const": "openrouter"},
-    "provider_model": {"const": "openrouter/free"},
+    "provider": {"const": "local"},
+    "provider_model": {"const": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"},
+    "provider_model_revision": {"const": "f86cb2c1fa58255f8052cc32aeede1b7482d4361"},
+    "provider_model_sha256": {"const": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046"},
+    "inference_authorization_id": {"type": ["string", "null"], "pattern": "^AUTH-[A-Z0-9-]{1,64}$"},
     "max_provider_calls": {"const": 1},
     "max_workflow_recoveries": {"type": "integer", "minimum": 0, "maximum": 3},
     "enabled": {"type": "boolean"}

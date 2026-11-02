@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import ados_executor as ae
+import run_local_model_once as qwen
 
 
 class FakeAdapter:
@@ -112,8 +113,11 @@ class DispatchValidationTests(unittest.TestCase):
             "task_prompt": "Synthetic fixture only. No external model call.",
             "acceptance_criteria": ["Fake worker observes the approved task."],
             "cost_ceiling_usd": 0.0,
-            "provider": "openrouter",
-            "provider_model": "openrouter/free",
+            "provider": "local",
+            "provider_model": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+            "provider_model_revision": "f86cb2c1fa58255f8052cc32aeede1b7482d4361",
+            "provider_model_sha256": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
+            "inference_authorization_id": "AUTH-SYNTHETIC-999",
             "max_provider_calls": 1,
             "max_workflow_recoveries": 2,
             "enabled": True,
@@ -316,6 +320,93 @@ class RemediationPolicyTests(unittest.TestCase):
         stale = dict(good); stale["last_verified_epoch"] = 1
         with self.assertRaisesRegex(ae.ExecutorError, "provider_eligibility_stale"):
             ae.validate_provider_record(stale, provider="fixture", model="free-fixture", now_epoch=5000)
+
+    def test_dispatch_manifest_selects_only_the_pinned_local_qwen_route(self):
+        payload = {
+            "issue_number": 999, "authorized_actors": ["chinkk-git"],
+            "repository": "chinkk-git/aaria-ados-poc", "task_id": "ADOS-POC-999",
+            "branch": "experiment/ados-e01-synthetic", "expected_base_sha": "a" * 40,
+            "permitted_paths": ["daily-practice.html"], "task_prompt": "Synthetic task",
+            "acceptance_criteria": ["Use fake worker"], "cost_ceiling_usd": 0.0,
+            "provider": "local", "provider_model": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+            "provider_model_revision": "f86cb2c1fa58255f8052cc32aeede1b7482d4361",
+            "provider_model_sha256": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
+            "inference_authorization_id": "AUTH-SYNTHETIC-999",
+            "max_provider_calls": 1, "max_workflow_recoveries": 2, "enabled": True,
+        }
+        parsed = ae.parse_dispatch_manifest(payload)
+        status = {"provider": "local", "model": parsed.provider_model,
+                  "eligibility": "VERIFIED_ZERO_COST", "cost_authorized_usd": 0.0,
+                  "quota_status": "NOT_APPLICABLE"}
+        ae.validate_local_qwen_record(status, parsed)
+        with self.assertRaisesRegex(ValueError, "dispatch_local_qwen_route_unapproved"):
+            ae.parse_dispatch_manifest({**payload, "provider_model_revision": "0" * 40})
+        with self.assertRaisesRegex(ValueError, "dispatch_inference_authorization_required"):
+            ae.parse_dispatch_manifest({**payload, "inference_authorization_id": None})
+
+    def test_local_qwen_prompt_and_output_are_one_file_bounded_and_scoped(self):
+        prompt = ae.build_local_qwen_prompt(
+            task_prompt="Update the page safely.",
+            acceptance_criteria=["Accessible status text"],
+            target_path="daily-practice.html", existing_content="<main>old</main>")
+        self.assertIn("Target file: daily-practice.html", prompt)
+        self.assertIn("<ADOS_FILE_CONTENT>", prompt)
+        self.assertEqual(ae.validate_local_qwen_output(
+            returned_path="daily-practice.html", expected_path="daily-practice.html",
+            content="<main>new</main>"), b"<main>new</main>")
+        with self.assertRaises(ae.UnauthorizedPath):
+            ae.validate_local_qwen_output(returned_path="README.md", expected_path="daily-practice.html",
+                                          content="no")
+        with self.assertRaisesRegex(ValueError, "local_qwen_existing_file_too_large"):
+            ae.build_local_qwen_prompt(task_prompt="change", acceptance_criteria=["ok"],
+                target_path="daily-practice.html", existing_content="x" * (ae.MAX_LOCAL_QWEN_BASE_FILE_BYTES + 1))
+        with self.assertRaisesRegex(ValueError, "local_qwen_prompt_too_large"):
+            ae.build_local_qwen_prompt(task_prompt="x" * ae.MAX_LOCAL_QWEN_PROMPT_BYTES,
+                acceptance_criteria=["ok"], target_path="daily-practice.html", existing_content="")
+        with self.assertRaisesRegex(ValueError, "local_qwen_output_invalid"):
+            ae.validate_local_qwen_output(returned_path="daily-practice.html", expected_path="daily-practice.html",
+                                          content="x" * (ae.MAX_LOCAL_QWEN_OUTPUT_BYTES + 1))
+
+    def test_existing_runner_prompt_override_is_bounded_and_default_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt_path = Path(tmp) / "prompt.txt"
+            self.assertIn("Daily Practice", qwen.load_prompt())
+            prompt_path.write_text("synthetic prompt", encoding="utf-8")
+            self.assertEqual(qwen.load_prompt(prompt_path), "synthetic prompt")
+            prompt_path.write_bytes(b"x" * (qwen.MAX_PROMPT_BYTES + 1))
+            with self.assertRaisesRegex(RuntimeError, "local_prompt_size_invalid"):
+                qwen.load_prompt(prompt_path)
+            prompt_path.write_bytes(b"  ")
+            with self.assertRaisesRegex(RuntimeError, "local_prompt_empty"):
+                qwen.load_prompt(prompt_path)
+
+    def test_local_qwen_server_environment_excludes_inherited_ci_credentials(self):
+        environment = qwen.isolated_server_environment(
+            home=Path("/tmp/fake-home"),
+            path="/usr/bin:/bin",
+        )
+        self.assertEqual(set(environment), {"PATH", "HOME", "LANG", "CUDA_VISIBLE_DEVICES"})
+        self.assertNotIn("GITHUB_TOKEN", environment)
+        self.assertNotIn("ACTIONS_RUNTIME_TOKEN", environment)
+
+    def test_live_local_provider_status_is_blocked_until_separately_authorized(self):
+        status = json.loads((Path(__file__).resolve().parents[1] / "providers" / "status.json").read_text())
+        payload = {
+            "issue_number": 999, "authorized_actors": ["chinkk-git"],
+            "repository": "chinkk-git/aaria-ados-poc", "task_id": "ADOS-POC-999",
+            "branch": "experiment/ados-e01-synthetic", "expected_base_sha": "a" * 40,
+            "permitted_paths": ["daily-practice.html"], "task_prompt": "Synthetic task",
+            "acceptance_criteria": ["No inference"], "cost_ceiling_usd": 0.0,
+            "provider": "local", "provider_model": ae.LOCAL_QWEN_MODEL,
+            "provider_model_revision": ae.LOCAL_QWEN_REVISION,
+            "provider_model_sha256": ae.LOCAL_QWEN_SHA256,
+            "inference_authorization_id": "AUTH-SYNTHETIC-999",
+            "max_provider_calls": 1, "max_workflow_recoveries": 2, "enabled": True,
+        }
+        manifest = ae.parse_dispatch_manifest(payload)
+        with self.assertRaisesRegex(ae.ExecutorError, "local_qwen_eligibility_unverified"):
+            ae.validate_local_qwen_record(status["local"], manifest)
+        self.assertEqual(status["local"]["eligibility"], "DISABLED")
 
     def test_repository_provider_status_blocks_current_exhausted_or_unverified_routes(self):
         status = json.loads((Path(__file__).resolve().parents[1] / "providers" / "status.json").read_text())

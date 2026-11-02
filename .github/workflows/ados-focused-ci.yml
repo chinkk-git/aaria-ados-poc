@@ -10,6 +10,7 @@ on:
       - schemas/**
       - tasks/**
       - scripts/ados_executor.py
+      - scripts/run_local_model_once.py
       - tests/test_ados_executor.py
       - providers/status.json
       - index.html

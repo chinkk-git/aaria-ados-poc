@@ -21,6 +21,11 @@ class LocalModelGuardPolicyTests(unittest.TestCase):
         self.assertNotRegex(workflow, r"prior_count\s*(?:>=|>)\s*(?!0(?:\D|$))\d+")
         self.assertIn('test "$CURRENT_ATTEMPT" = "1"', workflow)
 
+    def test_model_revision_is_a_full_immutable_commit(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "scripts" / "local_model_preflight.py").read_text()
+        self.assertRegex(source, r'^MODEL_REVISION = "[0-9a-f]{40}"$')
+
 
 if __name__ == "__main__":
     unittest.main()

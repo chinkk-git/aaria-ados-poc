@@ -15,27 +15,15 @@ try:
 except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as error:
     print("QUOTA_BLOCKED: key quota unavailable (" + type(error).__name__ + ")")
     sys.exit(2)
-# Free-tier daily cap: conservative upper bound; never assume a larger quota.
-# A provider may report fractional usage; round up to protect the reserve.
-import math
-used = data.get("usage_daily")
-limit = data.get("limit")
-remaining = data.get("limit_remaining")
-is_free = data.get("is_free_tier")
-if is_free is not True:
-    print("QUOTA_BLOCKED: cannot verify free-tier account")
+# The key endpoint's usage_daily and limit_remaining are monetary values,
+# NOT free-model request counts. Never mistake them for request quota.
+# Fail closed until a verified request-count source is integrated.
+request_remaining = data.get("free_requests_remaining")
+if not isinstance(request_remaining, int) or isinstance(request_remaining, bool) or request_remaining < 0:
+    print("QUOTA_BLOCKED: verified daily free-request counter unavailable; no model call made")
     sys.exit(2)
-if not isinstance(used, (int, float)) or isinstance(used, bool) or not math.isfinite(used) or used < 0:
-    print("QUOTA_BLOCKED: daily usage counter unavailable")
-    sys.exit(2)
-if remaining is not None and (not isinstance(remaining, (int, float)) or isinstance(remaining, bool) or not math.isfinite(remaining)):
-    print("QUOTA_BLOCKED: invalid remaining counter")
-    sys.exit(2)
-daily_remaining = max(0, 50 - math.ceil(used))
-if remaining is not None:
-    daily_remaining = min(daily_remaining, max(0, math.floor(remaining)))
 reserve = int(os.environ.get("ADOS_QUOTA_RESERVE", "10"))
-if daily_remaining <= reserve:
-    print("QUOTA_BLOCKED: insufficient free daily budget; retry only after verified quota recovery")
+if request_remaining <= reserve:
+    print("QUOTA_BLOCKED: free request reserve reached")
     sys.exit(2)
-print("QUOTA_OK: sufficient free daily budget with reserved review capacity")
+print("QUOTA_OK: free request budget available")

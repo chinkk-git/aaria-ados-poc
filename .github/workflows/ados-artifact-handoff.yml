@@ -68,7 +68,7 @@ jobs:
           fi
 
           # Read the immutable source artifact and verify its approved digest before claiming.
-          gh api "repos/$GH_REPOSITORY/contents/$SOURCE_PATH" -f "ref=$SOURCE_SHA" --jq -r .content |
+          gh api "repos/$GH_REPOSITORY/contents/$SOURCE_PATH" -f "ref=$SOURCE_SHA" --jq .content |
             tr -d '\r\n' | base64 --decode > "$RUNNER_TEMP/daily-practice.html"
           actual_digest="$(sha256sum "$RUNNER_TEMP/daily-practice.html" | cut -d' ' -f1)"
           test "$actual_digest" = "$SOURCE_SHA256" || {

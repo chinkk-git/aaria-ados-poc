@@ -363,7 +363,7 @@ class HandoffPolicyTests(unittest.TestCase):
             "CONSUMED_MARKER": CONSUMED_MARKER,
             "GITHUB_RUN_ID": "1001",
             "SOURCE_COMMIT_SHA": SOURCE_SHA,
-            "AUTHORIZED_PR_HEAD": "b" * 40,
+            "AUTHORIZED_PR_HEAD": LIVE_HEAD,
             "SOURCE_PATH": "evidence/local-model-attempt-2-validated.html",
             "SOURCE_SHA256": ARTIFACT_SHA,
             "TARGET_BRANCH": "feature/ados-poc-002",

@@ -85,7 +85,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         output_gate = step_run("Enforce single-file output")
         self.assertIn("node .ados-policy/scripts/check_daily_practice.js daily-practice.html", output_gate)
         self.assertLess(output_gate.index("check_daily_practice.js"), SOURCE.index("      - name: Preserve commit checkpoint"))
-        self.assertIn("ref: \${{ github.workflow_sha }}", SOURCE)
+        self.assertIn("ref: ${{ github.workflow_sha }}", SOURCE)
         self.assertIn("id=completeButton", SOURCE)
         self.assertIn("id=completionStatus", SOURCE)
 

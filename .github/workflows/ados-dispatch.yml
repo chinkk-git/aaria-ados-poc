@@ -274,6 +274,7 @@ jobs:
               target_path=target_path, existing_content=existing)
           prompt_file = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ados-qwen-prompt.txt"
           prompt_file.write_text(prompt, encoding="utf-8")
+          PY
 
       - name: Build the pinned local llama.cpp runtime
         if: github.run_attempt == 1

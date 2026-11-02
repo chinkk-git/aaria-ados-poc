@@ -1,0 +1,8 @@
+{
+  "task_id": "ADOS-POC-999",
+  "branch": "experiment/python-multiprovider-executor",
+  "scope_paths": ["daily-practice.html"],
+  "providers": ["local", "gemini", "openrouter"],
+  "cost_ceiling_usd": 0.0,
+  "max_provider_attempts": 3
+}

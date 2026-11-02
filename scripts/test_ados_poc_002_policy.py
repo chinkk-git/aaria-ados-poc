@@ -90,6 +90,18 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("id=completeButton", SOURCE)
         self.assertIn("id=completionStatus", SOURCE)
 
+    def test_verified_commit_opens_one_scoped_task_pr(self):
+        self.assertIn("pull-requests: write", SOURCE)
+        guard = step_run("Enforce one-time resume and task scope")
+        self.assertIn('gh pr list --repo "$GITHUB_REPOSITORY"', guard)
+        handoff = step_run("Preserve commit checkpoint")
+        self.assertIn("gh pr create", handoff)
+        self.assertLess(handoff.index("git push origin HEAD:feature/ados-poc-002"), handoff.index("gh pr create"))
+        self.assertIn("--base main", handoff)
+        self.assertIn("--head feature/ados-poc-002", handoff)
+        self.assertIn("--title \"[ADOS-POC-002] Daily Practice Complete\"", handoff)
+        self.assertIn("REJECTED: PR appeared before handoff", handoff)
+
     def run_page_check(self, html: str):
         with tempfile.TemporaryDirectory() as directory:
             page = Path(directory) / "daily-practice.html"

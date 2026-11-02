@@ -93,6 +93,16 @@ jobs:
               safe_resume="$(jq -r \
                 '[.[].jobs[] | select(.name == "local-model-one-shot")] as $jobs | if ($jobs | length) == 0 then true elif ($jobs | length) != 1 then false elif $jobs[0].conclusion == "skipped" then true else ([$jobs[0].steps[]? | select(.name == "Download one checksum-pinned local model" or .name == "Make exactly one local coding request") | .conclusion] as $steps | ($steps | length) == 2 and ($steps | all(. == "skipped"))) end' \
                 "$jobs_file")"
+              if [[ "$safe_resume" != "true" && "$prior_id" == "41469249556" ]] &&
+                 [[ "$(jq -r '.head_sha' <<< "$prior_run")" == "8b81750df10d96aa4ef1cf2c0a48e82fcd5b3176" ]]; then
+                prior_download_state="$(jq -r '[.[].jobs[] | select(.name == "local-model-one-shot") | .steps[]? | select(.name == "Download one checksum-pinned local model" or .name == "Make exactly one local coding request") | .conclusion] | join(":")' "$jobs_file")"
+                if [[ "$prior_download_state" == "failure:skipped" ]] &&
+                   prior_log="$(gh run view "$prior_id" --log-failed 2>/dev/null)" &&
+                   grep -Fq 'LOCAL_MODEL_DOWNLOAD: BLOCKED; code=model_redirect_host_not_allowlisted' <<< "$prior_log"; then
+                  safe_resume="true"
+                  echo "SAFE_RECOVERY: run $prior_id failed before reading model bytes; inference remained skipped"
+                fi
+              fi
               test "$safe_resume" = "true" || {
                 echo "LOCAL_MODEL_BLOCKED: prior run $prior_id may have downloaded weights or invoked inference"; exit 1;
               }

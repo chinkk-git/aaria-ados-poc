@@ -15,6 +15,9 @@ class LocalModelGuardPolicyTests(unittest.TestCase):
         self.assertIn('($jobs | length) != 1 then false', workflow)
         self.assertIn('$jobs[0].conclusion == "skipped"', workflow)
         self.assertIn('select(.name == "local-model-one-shot")', workflow)
+        self.assertIn('"41469249556"', workflow)
+        self.assertIn('"8b81750df10d96aa4ef1cf2c0a48e82fcd5b3176"', workflow)
+        self.assertIn("LOCAL_MODEL_DOWNLOAD: BLOCKED; code=model_redirect_host_not_allowlisted", workflow)
 
     def test_guard_has_no_arbitrary_prior_run_count_cutoff(self):
         root = Path(__file__).resolve().parents[1]

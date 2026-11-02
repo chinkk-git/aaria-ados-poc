@@ -9,7 +9,12 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from local_model_preflight import MODEL_SIZE_BYTES, model_url, verify_model
+from local_model_preflight import (
+    DOWNLOAD_ALLOWED_HOSTS,
+    MODEL_SIZE_BYTES,
+    model_url,
+    verify_model,
+)
 
 
 def download(destination: Path) -> dict[str, object]:
@@ -22,12 +27,7 @@ def download(destination: Path) -> dict[str, object]:
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             host = urllib.parse.urlparse(response.geturl()).hostname or ""
-            if host not in {
-                "huggingface.co",
-                "cas-bridge.xethub.hf.co",
-                "cas-server.xethub.hf.co",
-                "cdn-lfs.huggingface.co",
-            }:
+            if host not in DOWNLOAD_ALLOWED_HOSTS:
                 raise RuntimeError("model_redirect_host_not_allowlisted")
             announced = response.headers.get("Content-Length")
             if not announced or not announced.isdigit() or int(announced) != MODEL_SIZE_BYTES:

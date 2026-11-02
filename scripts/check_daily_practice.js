@@ -70,12 +70,12 @@ function runPage(html, storage) {
   };
   for (const script of scripts) {
     try {
-      vm.runInNewContext(script, context, { timeout: 1000 });
+      vm.runInNewContext(script, context, { timeout: 1000, codeGeneration: { strings: false, wasm: false } });
     } catch (error) {
       fail("page script failed in isolated DOM: " + error.message);
     }
   }
-  return elements;
+  return { elements, context };
 }
 const file = process.argv[2];
 if (!file) fail("usage: node scripts/check_daily_practice.js <html-file>");
@@ -96,10 +96,10 @@ const storage = {
 };
 
 const firstLoad = runPage(html, storage);
-if (firstLoad.completionStatus.textContent !== "Not completed") fail("page did not start in Not completed state");
-firstLoad.completeButton.click();
-if (firstLoad.completionStatus.textContent !== "Completed") fail("clicking Mark Complete did not change status to Completed");
+if (firstLoad.elements.completionStatus.textContent !== "Not completed") fail("page did not start in Not completed state");
+vm.runInNewContext("document.getElementById('completeButton').click()", firstLoad.context, { timeout: 1000, codeGeneration: { strings: false, wasm: false } });
+if (firstLoad.elements.completionStatus.textContent !== "Completed") fail("clicking Mark Complete did not change status to Completed");
 
 const reloaded = runPage(html, storage);
-if (reloaded.completionStatus.textContent !== "Not completed") fail("completion state did not reset after reload");
+if (reloaded.elements.completionStatus.textContent !== "Not completed") fail("completion state did not reset after reload");
 console.log("VERIFIED: initial state, click transition, and reset on reload");

@@ -3,6 +3,7 @@ run-name: ADOS-POC-002 issue-${{ github.event.issue.number }}
 on:
   issues:
     types: [opened]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,8 +16,9 @@ jobs:
   execute:
     if: >-
       github.actor == 'chinkk-git' &&
-      github.event.issue.user.login == 'chinkk-git' &&
-      github.event.issue.title == '[ADOS-POC-002] Daily Practice Complete'
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.user.login == 'chinkk-git' &&
+      github.event.issue.title == '[ADOS-POC-002] Daily Practice Complete'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -67,6 +69,29 @@ jobs:
             }
           }
           JSON
+      - name: Fail-closed free-model quota preflight
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${OPENROUTER_API_KEY:-}" || { echo "BLOCKED_QUOTA: missing key"; exit 1; }
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error, sys
+          req=urllib.request.Request('https://openrouter.ai/api/v1/key',headers={'Authorization':'Bearer '+os.environ['OPENROUTER_API_KEY']})
+          try:
+              with urllib.request.urlopen(req,timeout=15) as response:
+                  payload=json.load(response)
+          except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError,ValueError) as exc:
+              print('BLOCKED_QUOTA: quota status unavailable ('+type(exc).__name__+')')
+              sys.exit(1)
+          quota=(payload.get('data') or {}).get('free_model_daily_requests')
+          remaining=quota.get('remaining') if isinstance(quota,dict) else None
+          if type(remaining) is not int or remaining < 5:
+              print('BLOCKED_QUOTA: insufficient or unverified free requests')
+              sys.exit(1)
+          print('VERIFIED: free-model daily quota threshold met; model-specific limits still apply')
+          PY
       - name: Run OpenCode free-model worker
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}

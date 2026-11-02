@@ -4,9 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import download
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import download_local_model as download
 
 
 class LocalModelDownloadPolicyTests(unittest.TestCase):

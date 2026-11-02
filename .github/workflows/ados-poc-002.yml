@@ -39,14 +39,17 @@ jobs:
           existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-poc-002" --state all --json number --jq 'length')"
           test "$existing" = "0" || { echo "REJECTED: existing PR"; exit 1; }
           echo "VERIFIED: exclusive branch ready"
-      - name: Enforce free-request budget before model invocation
+      - name: Enforce durable free-quota checkpoint before model invocation
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ADOS_QUOTA_RESERVE: '10'
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/openrouter_quota_guard.py
+          quota_dir="$RUNNER_TEMP/ados-quota"
+          mkdir -p "$quota_dir"
+          gh api "repos/$GITHUB_REPOSITORY/contents/scripts/openrouter_quota_guard.py?ref=main" --jq .content | base64 --decode > "$quota_dir/openrouter_quota_guard.py"
+          gh api "repos/$GITHUB_REPOSITORY/contents/state/ados-poc-002-quota.json?ref=main" --jq .content | base64 --decode > "$quota_dir/ados-poc-002-quota.json"
+          python3 "$quota_dir/openrouter_quota_guard.py" --status-file "$quota_dir/ados-poc-002-quota.json"
       - name: Install pinned executor
         run: |
           set -euo pipefail

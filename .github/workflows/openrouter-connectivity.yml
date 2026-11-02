@@ -1,0 +1,56 @@
+name: OpenRouter free-model connectivity (manual)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  free-model-connectivity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Verify free-model API response without exposing secrets
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, urllib.request, urllib.error
+          key = os.environ.get("OPENROUTER_API_KEY", "")
+          if not key:
+              print("BLOCKED: OPENROUTER_API_KEY secret is unavailable.")
+              sys.exit(1)
+          # openrouter/free routes only to eligible free models.
+          payload = json.dumps({
+              "model": "openrouter/free",
+              "messages": [{"role": "user", "content": "Reply with exactly: ADOS_CONNECTIVITY_OK"}],
+              "max_tokens": 32,
+              "temperature": 0
+          }).encode()
+          request = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=payload,
+              headers={"Authorization": "Bearer " + key,
+                       "Content-Type": "application/json"},
+              method="POST"
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=45) as response:
+                  data = json.load(response)
+          except urllib.error.HTTPError as error:
+              # Never print provider error body or request headers.
+              print("BLOCKED: OpenRouter HTTP status", error.code)
+              sys.exit(1)
+          except Exception:
+              print("BLOCKED: OpenRouter connectivity or response error.")
+              sys.exit(1)
+          choices = data.get("choices") or []
+          message = (choices[0].get("message") or {}) if choices else {}
+          if isinstance(message.get("content"), str) and message["content"].strip():
+              print("VERIFIED: Free-model API returned a nonempty response.")
+          else:
+              print("BLOCKED: No nonempty model response.")
+              sys.exit(1)
+          PY

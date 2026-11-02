@@ -1,0 +1,127 @@
+name: ADOS task dispatch
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ados-poc-001-exclusive-write-lease
+  cancel-in-progress: false
+
+jobs:
+  dispatch-ados-poc-001:
+    if: >-
+      github.actor == 'chinkk-git' &&
+      github.event.issue.user.login == 'chinkk-git' &&
+      github.event.issue.title == '[ADOS-POC-001] Simple Practice Timer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out the single assigned task branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: feature/ados-control-plane-poc
+          persist-credentials: false
+
+      - name: Enforce idempotency and existing branch lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-control-plane-poc" --state all --json number --jq 'length')"
+          if [[ "$existing" != "0" ]]; then
+            echo "REJECTED: task branch already has a PR; duplicate dispatch blocked."
+            exit 1
+          fi
+          if [[ -z "$(git ls-remote --heads origin feature/ados-control-plane-poc)" ]]; then
+            echo "REJECTED: assigned branch lease is missing."
+            exit 1
+          fi
+          echo "LEASE: one dispatch owns feature/ados-control-plane-poc."
+
+      - name: Install pinned OpenCode CLI
+        run: |
+          set -euo pipefail
+          npm install --global @opencode/cli@2.2.5
+          opencode --version
+
+      - name: Configure strict task write scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > opencode.json <<'JSON'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "permission": {
+              "*": "deny",
+              "read": {
+                "*": "allow",
+                "*.env": "deny",
+                "*.env.*": "deny"
+              },
+              "glob": "allow",
+              "grep": "allow",
+              "edit": {
+                "*": "deny",
+                "index.html": "allow"
+              },
+              "external_directory": "deny",
+              "bash": "deny",
+              "task": "deny",
+              "webfetch": "deny",
+              "websearch": "deny",
+              "lsp": "deny",
+              "todowrite": "deny"
+            }
+          }
+          JSON
+
+      - name: Run the authenticated coding executor
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'rm -f opencode.json' EXIT
+          opencode run --standalone --auto \
+            --model openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free \
+            "Implement ADOS-POC-001 in this repository. Create only index.html: a small accessible static practice timer with a visible 15-minute countdown, Start, Pause, and Reset. Start begins the countdown and resumes after Pause; Reset restores 15:00 and stops it. No authentication, personal data, external resources, frameworks, or production integration. Keep implementation focused and self-contained."
+
+      - name: Reject out-of-scope edits and empty output
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed="$(git status --porcelain | sed 's/^...//')"
+          if [[ "$changed" != "index.html" || ! -s index.html ]]; then
+            echo "REJECTED: executor output must contain only a nonempty index.html."
+            git status --short
+            exit 1
+          fi
+          echo "VERIFIED: executor changed only index.html."
+
+      - name: Commit, push and open the task PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- index.html
+          git commit -m "feat: implement ADOS practice timer"
+          gh auth setup-git
+          git push origin HEAD:feature/ados-control-plane-poc
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head feature/ados-control-plane-poc \
+            --title "[ADOS-POC-001] Simple Practice Timer" \
+            --body "Automated executor result for task issue #${ISSUE_NUMBER}. The OpenCode worker was invoked by the issue-opened workflow. Only index.html was in its write scope; focused verification and independent review are next."

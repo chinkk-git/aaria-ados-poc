@@ -121,14 +121,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          trap 'rm -rf .ados-policy' EXIT
+          test -s daily-practice.html || { echo "REJECTED: empty output"; exit 1; }
+          node .ados-policy/scripts/check_daily_practice.js daily-practice.html
           changed="$(git status --porcelain | sed 's/^...//')"
           test "$changed" = "daily-practice.html" || { echo "REJECTED: unexpected changes"; git status --short; exit 1; }
-          test -s daily-practice.html || { echo "REJECTED: empty output"; exit 1; }
-          grep -Fq '<h1>Daily Practice</h1>' daily-practice.html || { echo "REJECTED: missing page heading"; exit 1; }
-          grep -Fq 'Mark Complete' daily-practice.html || { echo "REJECTED: missing completion button"; exit 1; }
-          grep -Fq 'Not completed' daily-practice.html || { echo "REJECTED: missing initial state"; exit 1; }
-          grep -Fq 'Completed' daily-practice.html || { echo "REJECTED: missing completed state"; exit 1; }
-          echo "VERIFIED: only daily-practice.html changed and required content is present"
+          echo "VERIFIED: only daily-practice.html changed and initial, click, and reload behavior passed"
 
       - name: Preserve commit checkpoint
         env:

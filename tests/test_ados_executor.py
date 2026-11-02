@@ -92,6 +92,156 @@ class ErrorClassificationTests(unittest.TestCase):
                          ae.FailureKind.AUTHENTICATION)
 
 
+class DispatchValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.manifest_dir = self.root / "tasks" / "issues"
+        self.manifest_dir.mkdir(parents=True)
+        self.issue = 999
+        self.sha = "a" * 40
+        self.event_key = "b" * 64
+        self.payload = {
+            "issue_number": self.issue,
+            "authorized_actors": ["chinkk-git"],
+            "repository": "chinkk-git/aaria-ados-poc",
+            "task_id": "ADOS-POC-999",
+            "branch": "experiment/ados-e01-synthetic",
+            "expected_base_sha": self.sha,
+            "permitted_paths": ["daily-practice.html"],
+            "task_prompt": "Synthetic fixture only. No external model call.",
+            "acceptance_criteria": ["Fake worker observes the approved task."],
+            "cost_ceiling_usd": 0.0,
+            "max_attempts": 1,
+            "enabled": True,
+        }
+        self.path = self.manifest_dir / f"{self.issue}.json"
+        self.write_manifest()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_manifest(self, payload=None):
+        self.path.write_text(json.dumps(payload or self.payload), encoding="utf-8")
+
+    def resolve(self, **kwargs):
+        options = {
+            "actor": "chinkk-git",
+            "repository": "chinkk-git/aaria-ados-poc",
+            "base_sha": self.sha,
+            "event_key": self.event_key,
+        }
+        options.update(kwargs)
+        return ae.load_trusted_dispatch_manifest(self.root, self.issue, **options)
+
+    def test_approved_synthetic_issue_resolves_trusted_manifest_once_without_side_effects(self):
+        class FakeWorkerAdapter:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, manifest):
+                self.calls += 1
+                return manifest.task_id
+
+        worker = FakeWorkerAdapter()
+        before = self.path.read_bytes()
+        with patch.object(ae, "_http_json") as provider_call, \
+             patch.object(ae.subprocess, "run") as repository_write:
+            manifest = self.resolve()
+            self.assertEqual(worker.execute(manifest), "ADOS-POC-999")
+        self.assertEqual(worker.calls, 1)
+        provider_call.assert_not_called()
+        repository_write.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(list(self.manifest_dir.iterdir()), [self.path])
+
+    def test_unknown_issue_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "dispatch_manifest_not_allowlisted"):
+            ae.load_trusted_dispatch_manifest(
+                self.root, 998, actor="chinkk-git", repository="chinkk-git/aaria-ados-poc",
+                base_sha=self.sha, event_key=self.event_key,
+            )
+
+    def test_actor_mismatch_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "dispatch_actor_mismatch"):
+            self.resolve(actor="unapproved-user")
+
+    def test_branch_and_path_violations_are_rejected(self):
+        payload = dict(self.payload)
+        payload["branch"] = "main"
+        self.write_manifest(payload)
+        with self.assertRaisesRegex(ValueError, "invalid_branch"):
+            self.resolve()
+        payload = dict(self.payload)
+        payload["permitted_paths"] = ["../README.md"]
+        self.write_manifest(payload)
+        with self.assertRaisesRegex(ae.UnauthorizedPath, "unsafe_path"):
+            self.resolve()
+        self.write_manifest()
+
+    def test_stale_base_sha_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "dispatch_stale_base_sha"):
+            self.resolve(base_sha="c" * 40)
+
+    def test_repository_task_binding_cost_and_attempt_limits_are_enforced(self):
+        with self.assertRaisesRegex(ValueError, "dispatch_repository_mismatch"):
+            self.resolve(repository="other/repository")
+        for field, value in (("task_id", "ADOS-POC-998"),
+                             ("task_prompt", "  "),
+                             ("acceptance_criteria", []),
+                             ("cost_ceiling_usd", 0.01),
+                             ("max_attempts", 4)):
+            with self.subTest(field=field):
+                payload = dict(self.payload)
+                payload[field] = value
+                self.write_manifest(payload)
+                with self.assertRaises(ValueError):
+                    self.resolve()
+        self.write_manifest()
+
+    def test_allowlist_rejects_a_second_task_for_the_same_branch(self):
+        other = dict(self.payload)
+        other.update({"issue_number": 998, "task_id": "ADOS-POC-998"})
+        (self.manifest_dir / "998.json").write_text(json.dumps(other), encoding="utf-8")
+        with self.assertRaisesRegex(ae.DuplicateExecution, "dispatch_branch_or_task_already_allowlisted"):
+            self.resolve()
+
+    def test_duplicate_event_key_is_rejected(self):
+        with self.assertRaisesRegex(ae.DuplicateExecution, "dispatch_duplicate_event"):
+            self.resolve(seen_event_keys=[self.event_key])
+
+    def test_unconsumed_checkpoint_can_resume_only_under_original_run(self):
+        resumed = ae.load_trusted_dispatch_manifest(
+            self.root, self.issue, actor="chinkk-git", repository="chinkk-git/aaria-ados-poc",
+            base_sha=self.sha, event_key=self.event_key,
+            seen_event_keys=[self.event_key], resumable_event_keys=[self.event_key],
+        )
+        self.assertEqual(resumed.task_id, "ADOS-POC-999")
+        with self.assertRaises(ae.DuplicateExecution):
+            self.resolve(seen_event_keys=[self.event_key])
+
+    def test_consumed_claim_cannot_be_reused(self):
+        with self.assertRaisesRegex(ae.DuplicateExecution, "dispatch_claim_consumed"):
+            self.resolve(consumed_task_ids=["ADOS-POC-999"])
+
+    def test_same_synthetic_event_cannot_execute_twice(self):
+        class FakeWorkerAdapter:
+            calls = 0
+
+            def execute(self, manifest):
+                self.calls += 1
+
+        worker = FakeWorkerAdapter()
+        ledger = {"events": set(), "tasks": set()}
+        manifest = self.resolve()
+        worker.execute(manifest)
+        ledger["events"].add(self.event_key)
+        ledger["tasks"].add(manifest.task_id)
+        with self.assertRaises(ae.DuplicateExecution):
+            self.resolve(seen_event_keys=ledger["events"], consumed_task_ids=ledger["tasks"])
+        self.assertEqual(worker.calls, 1)
+
+
 class OrchestrationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

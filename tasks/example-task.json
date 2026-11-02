@@ -1,8 +1,14 @@
 {
+  "issue_number": 999,
+  "authorized_actors": ["chinkk-git"],
+  "repository": "chinkk-git/aaria-ados-poc",
   "task_id": "ADOS-POC-999",
-  "branch": "experiment/python-multiprovider-executor",
-  "scope_paths": ["daily-practice.html"],
-  "providers": ["local", "gemini", "openrouter"],
+  "branch": "experiment/ados-e01-synthetic",
+  "expected_base_sha": "a64c9e8caf37eef22ade5651734bdc9a5bd53ee7",
+  "permitted_paths": ["daily-practice.html"],
+  "task_prompt": "Synthetic fixture only. No external model call, provider call, or repository write.",
+  "acceptance_criteria": ["The fake worker receives this manifest once."],
   "cost_ceiling_usd": 0.0,
-  "max_provider_attempts": 3
+  "max_attempts": 1,
+  "enabled": false
 }

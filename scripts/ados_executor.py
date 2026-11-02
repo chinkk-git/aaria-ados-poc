@@ -111,7 +111,8 @@ def validate_task_id(task_id: str) -> None:
 def validate_branch(branch: str) -> None:
     if not re.fullmatch(r"(?:feature|experiment)/[a-z0-9][a-z0-9._/-]*", branch):
         raise ValueError("invalid_branch")
-    if branch == "main" or ".." in branch.split("/"):
+    parts = branch.split("/")
+    if branch == "main" or any(part in {"", ".", ".."} for part in parts):
         raise ValueError("protected_or_invalid_branch")
 
 
@@ -191,6 +192,166 @@ def load_manifest(path: Path) -> TaskManifest:
         cost_ceiling_usd=float(payload["cost_ceiling_usd"]),
         max_provider_attempts=attempts,
     )
+
+
+@dataclass(frozen=True)
+class DispatchManifest:
+    """Owner-approved, per-issue dispatch authorization committed on main."""
+
+    issue_number: int
+    authorized_actors: tuple[str, ...]
+    repository: str
+    task_id: str
+    branch: str
+    expected_base_sha: str
+    permitted_paths: tuple[str, ...]
+    task_prompt: str
+    acceptance_criteria: tuple[str, ...]
+    cost_ceiling_usd: float
+    max_attempts: int
+    enabled: bool
+
+
+DISPATCH_FIELDS = {
+    "issue_number", "authorized_actors", "repository", "task_id", "branch",
+    "expected_base_sha", "permitted_paths", "task_prompt", "acceptance_criteria",
+    "cost_ceiling_usd", "max_attempts", "enabled",
+}
+
+
+def parse_dispatch_manifest(payload: object) -> DispatchManifest:
+    """Parse and strictly validate a trusted dispatch manifest without side effects."""
+    if not isinstance(payload, dict) or set(payload) != DISPATCH_FIELDS:
+        raise ValueError("dispatch_manifest_fields_mismatch")
+    if type(payload["issue_number"]) is not int or payload["issue_number"] < 1:
+        raise ValueError("dispatch_issue_number_invalid")
+    if type(payload["enabled"]) is not bool or not payload["enabled"]:
+        raise ValueError("dispatch_manifest_disabled")
+    actors = payload["authorized_actors"]
+    if not isinstance(actors, list) or not actors or any(
+        not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,39}", value)
+        for value in actors
+    ) or len(set(actors)) != len(actors):
+        raise ValueError("dispatch_actor_allowlist_invalid")
+    repository = payload["repository"]
+    if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise ValueError("dispatch_repository_invalid")
+    task_id = payload["task_id"]
+    if not isinstance(task_id, str):
+        raise ValueError("dispatch_task_id_invalid")
+    validate_task_id(task_id)
+    if task_id != f"ADOS-POC-{payload['issue_number']:03d}":
+        raise ValueError("dispatch_task_issue_binding_mismatch")
+    branch = payload["branch"]
+    if not isinstance(branch, str):
+        raise ValueError("dispatch_branch_invalid")
+    validate_branch(branch)
+    expected_base_sha = payload["expected_base_sha"]
+    if not isinstance(expected_base_sha, str) or not exact_sha(expected_base_sha):
+        raise ValueError("dispatch_base_sha_invalid")
+    paths = payload["permitted_paths"]
+    if not isinstance(paths, list) or not paths or any(not isinstance(p, str) for p in paths):
+        raise ValueError("dispatch_paths_invalid")
+    for path in paths:
+        normalize_scope_path(path)
+    if len(set(paths)) != len(paths):
+        raise ValueError("dispatch_paths_duplicate")
+    prompt = payload["task_prompt"]
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 12000:
+        raise ValueError("dispatch_prompt_invalid")
+    criteria = payload["acceptance_criteria"]
+    if not isinstance(criteria, list) or not criteria or any(
+        not isinstance(c, str) or not c.strip() or len(c) > 1000 for c in criteria
+    ) or len(set(criteria)) != len(criteria):
+        raise ValueError("dispatch_acceptance_invalid")
+    cost = payload["cost_ceiling_usd"]
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost != 0:
+        raise ValueError("dispatch_cost_must_be_zero")
+    attempts = payload["max_attempts"]
+    if type(attempts) is not int or not 1 <= attempts <= 3:
+        raise ValueError("dispatch_attempt_limit_invalid")
+    return DispatchManifest(
+        issue_number=payload["issue_number"], authorized_actors=tuple(actors),
+        repository=repository, task_id=task_id, branch=branch,
+        expected_base_sha=expected_base_sha, permitted_paths=tuple(paths),
+        task_prompt=prompt, acceptance_criteria=tuple(criteria),
+        cost_ceiling_usd=float(cost), max_attempts=attempts, enabled=True,
+    )
+
+
+def load_trusted_dispatch_manifest(
+    repository_root: Path,
+    issue_number: int,
+    *,
+    actor: str,
+    repository: str,
+    base_sha: str,
+    event_key: str,
+    seen_event_keys: Sequence[str] = (),
+    consumed_task_ids: Sequence[str] = (),
+    resumable_event_keys: Sequence[str] = (),
+) -> DispatchManifest:
+    """Resolve tasks/issues/<number>.json and reject every mismatch before dispatch."""
+    if type(issue_number) is not int or issue_number < 1:
+        raise ValueError("dispatch_issue_number_invalid")
+    manifest_path = (repository_root / "tasks" / "issues" / f"{issue_number}.json").resolve()
+    trusted_root = (repository_root / "tasks" / "issues").resolve()
+    if manifest_path.parent != trusted_root:
+        raise ValueError("dispatch_manifest_path_escape")
+    if not manifest_path.is_file():
+        raise ValueError("dispatch_manifest_not_allowlisted")
+    manifest = parse_dispatch_manifest(json.loads(manifest_path.read_text(encoding="utf-8")))
+    if manifest.issue_number != issue_number:
+        raise ValueError("dispatch_issue_mismatch")
+    if actor not in manifest.authorized_actors:
+        raise ValueError("dispatch_actor_mismatch")
+    if repository != manifest.repository:
+        raise ValueError("dispatch_repository_mismatch")
+    if base_sha != manifest.expected_base_sha:
+        raise ValueError("dispatch_stale_base_sha")
+    if not isinstance(event_key, str) or not re.fullmatch(r"[0-9a-f]{64}", event_key):
+        raise ValueError("dispatch_event_key_invalid")
+    if event_key in seen_event_keys and event_key not in resumable_event_keys:
+        raise DuplicateExecution("dispatch_duplicate_event")
+    if manifest.task_id in consumed_task_ids:
+        raise DuplicateExecution("dispatch_claim_consumed")
+    for other_path in trusted_root.glob("*.json"):
+        if other_path == manifest_path:
+            continue
+        other_payload = json.loads(other_path.read_text(encoding="utf-8"))
+        if isinstance(other_payload, dict) and other_payload.get("enabled") is False:
+            continue
+        other = parse_dispatch_manifest(other_payload)
+        if other.enabled and (other.branch == manifest.branch or other.task_id == manifest.task_id):
+            raise DuplicateExecution("dispatch_branch_or_task_already_allowlisted")
+    return manifest
+
+
+def dispatch_event_key(repository: str, issue_number: int, action: str,
+                       created_at: str, manifest_bytes: bytes) -> str:
+    """Stable idempotency key for duplicate deliveries of one issue-open event."""
+    manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+    material = "\0".join((repository, str(issue_number), action, created_at, manifest_digest))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+CLAIM_MARKER = re.compile(r"<!-- ADOS_DISPATCH_CLAIM task=(ADOS-POC-[0-9]{3}) event=([0-9a-f]{64}) run=([0-9]+) -->")
+CONSUMED_MARKER = re.compile(r"<!-- ADOS_DISPATCH_CONSUMED task=(ADOS-POC-[0-9]{3}) event=([0-9a-f]{64}) run=([0-9]+) -->")
+
+
+def dispatch_ledger(comment_bodies: Sequence[str]) -> tuple[set[str], set[str], dict[str, str]]:
+    """Extract durable event and task consumption markers from issue comments."""
+    events: set[str] = set()
+    tasks: set[str] = set()
+    claims: dict[str, str] = {}
+    for body in comment_bodies:
+        for match in CLAIM_MARKER.finditer(body):
+            events.add(match.group(2))
+            claims[match.group(2)] = match.group(3)
+        for match in CONSUMED_MARKER.finditer(body):
+            tasks.add(match.group(1))
+            events.add(match.group(2))
+    return events, tasks, claims
 
 
 @dataclass(frozen=True)
@@ -745,3 +906,65 @@ class Executor:
 def environment_key(name: str) -> Callable[[], str]:
     """Return a lazy secret supplier; secret values are never serialized or logged."""
     return lambda: os.environ.get(name, "")
+
+
+def validate_dispatch_cli(argv: Sequence[str] | None = None) -> int:
+    """Read-only workflow preflight. It never acquires a lease or invokes a provider."""
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--issue", required=True, type=int)
+    parser.add_argument("--actor", required=True)
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--base-sha", required=True)
+    parser.add_argument("--created-at", required=True)
+    parser.add_argument("--action", required=True)
+    parser.add_argument("--comments-json", required=True, type=Path)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--run-attempt", required=True, type=int)
+    parser.add_argument("--repository-root", type=Path, default=Path.cwd())
+    args = parser.parse_args(argv)
+    comments = json.loads(args.comments_json.read_text(encoding="utf-8"))
+    if not isinstance(comments, list) or any(not isinstance(item, str) for item in comments):
+        raise ValueError("dispatch_comments_invalid")
+    manifest_path = args.repository_root / "tasks" / "issues" / f"{args.issue}.json"
+    manifest_bytes = manifest_path.read_bytes()
+    event_key = dispatch_event_key(
+        args.repository, args.issue, args.action, args.created_at, manifest_bytes
+    )
+    seen_events, consumed_tasks, claims = dispatch_ledger(comments)
+    claim_run = claims.get(event_key)
+    resumable_events: set[str] = set()
+    if claim_run is not None and claim_run == args.run_id and args.run_attempt > 1:
+        resumable_events.add(event_key)
+    manifest = load_trusted_dispatch_manifest(
+        args.repository_root, args.issue, actor=args.actor, repository=args.repository,
+        base_sha=args.base_sha, event_key=event_key,
+        seen_event_keys=seen_events, consumed_task_ids=consumed_tasks,
+        resumable_event_keys=resumable_events,
+    )
+    if args.run_attempt > manifest.max_attempts:
+        raise DuplicateExecution("dispatch_attempt_limit_exceeded")
+    if claim_run is not None and (claim_run != args.run_id or event_key not in resumable_events):
+        raise DuplicateExecution("dispatch_claim_owned_by_another_run")
+    print(json.dumps({
+        "issue_number": manifest.issue_number,
+        "task_id": manifest.task_id,
+        "branch": manifest.branch,
+        "expected_base_sha": manifest.expected_base_sha,
+        "permitted_paths": list(manifest.permitted_paths),
+        "task_prompt": manifest.task_prompt,
+        "acceptance_criteria": list(manifest.acceptance_criteria),
+        "max_attempts": manifest.max_attempts,
+        "event_key": event_key,
+        "resume": event_key in resumable_events,
+    }, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2 or sys.argv[1] != "validate-dispatch":
+        raise SystemExit("usage: ados_executor.py validate-dispatch [options]")
+    raise SystemExit(validate_dispatch_cli(sys.argv[2:]))

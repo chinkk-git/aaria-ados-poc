@@ -29,6 +29,21 @@ MAX_PEAK_RSS_BYTES = 4 * 1024**3
 MIN_FREE_DISK_BYTES = 6 * 1024**3
 MIN_AVAILABLE_RAM_BYTES = 8 * 1024**3
 MIN_TOTAL_RAM_BYTES = 12 * 1024**3
+DOWNLOAD_ALLOWED_HOSTS = {
+    # Current Hugging Face Hub storage and CDN endpoints documented at:
+    # https://huggingface.co/docs/hub/models-downloading#downloading-behind-a-proxy-or-firewall
+    "huggingface.co",
+    "cas-bridge.xethub.hf.co",
+    "cas-server.xethub.hf.co",
+    "cas-server.xethub-eu.hf.co",
+    "transfer.xethub.hf.co",
+    "transfer.xethub-eu.hf.co",
+    "us.aws.cdn.hf.co",
+    "us.gcp.cdn.hf.co",
+    "cdn-lfs.huggingface.co",
+    "cdn-lfs-us-1.hf.co",
+    "cdn-lfs-eu-1.hf.co",
+}
 
 
 def meminfo_bytes(field: str) -> int:
@@ -107,13 +122,7 @@ def verify_remote_metadata(timeout: float = 20.0) -> tuple[int, str]:
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         final_host = urllib.parse.urlparse(response.geturl()).hostname or ""
-        allowed_hosts = {
-            "huggingface.co",
-            "cas-bridge.xethub.hf.co",
-            "cas-server.xethub.hf.co",
-            "cdn-lfs.huggingface.co",
-        }
-        if final_host not in allowed_hosts:
+        if final_host not in DOWNLOAD_ALLOWED_HOSTS:
             raise RuntimeError("model_redirect_host_not_allowlisted")
         size = response.headers.get("Content-Length")
         if not size or not size.isdigit():

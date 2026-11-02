@@ -64,6 +64,35 @@ class LocalModelMetadataTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "model_license_metadata_mismatch"):
                 preflight.verify_model_card_metadata()
 
+    def test_documented_hugging_face_download_hosts_are_allowlisted(self):
+        for host in (
+            "us.aws.cdn.hf.co",
+            "us.gcp.cdn.hf.co",
+            "transfer.xethub.hf.co",
+            "transfer.xethub-eu.hf.co",
+            "cas-server.xethub-eu.hf.co",
+            "cdn-lfs-us-1.hf.co",
+            "cdn-lfs-eu-1.hf.co",
+        ):
+            with self.subTest(host=host):
+                response = MagicMock()
+                response.geturl.return_value = f"https://{host}/signed/model"
+                response.__enter__.return_value = response
+                response.headers = {"Content-Length": str(preflight.MODEL_SIZE_BYTES)}
+                with patch.object(preflight.urllib.request, "urlopen", return_value=response):
+                    size, verified_host = preflight.verify_remote_metadata()
+                self.assertEqual(size, preflight.MODEL_SIZE_BYTES)
+                self.assertEqual(verified_host, host)
+
+    def test_unknown_download_redirect_host_is_rejected(self):
+        response = MagicMock()
+        response.geturl.return_value = "https://untrusted.example/signed/model"
+        response.__enter__.return_value = response
+        response.headers = {"Content-Length": str(preflight.MODEL_SIZE_BYTES)}
+        with patch.object(preflight.urllib.request, "urlopen", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "model_redirect_host_not_allowlisted"):
+                preflight.verify_remote_metadata()
+
 
 if __name__ == "__main__":
     unittest.main()

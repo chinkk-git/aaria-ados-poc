@@ -7,13 +7,22 @@ import { dirname, resolve } from "node:path";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const html = readFileSync(resolve(root, "index.html"), "utf8");
-const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+const script = html.match(/<script>([\\s\\S]*?)<\\/script>/)?.[1];
 assert.ok(script, "timer script is present");
 
 function loadTimer() {
   const timer = { textContent: "" };
   const buttons = Object.fromEntries(
-    ["start", "pause", "reset"].map((id) => [id, {\n      listener: null,\n      addEventListener(event, listener) {\n        assert.equal(event, "click");\n        this.listener = listener;\n      },\n    }]),
+    ["start", "pause", "reset"].map((id) => [
+      id,
+      {
+        listener: null,
+        addEventListener(event, listener) {
+          assert.equal(event, "click");
+          this.listener = listener;
+        },
+      },
+    ]),
   );
   const intervals = new Map();
   let nextInterval = 1;

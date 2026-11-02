@@ -48,6 +48,29 @@ class LocalModelGuardPolicyTests(unittest.TestCase):
         self.assertIn('"max_inference_requests": 1', record)
         self.assertIn('"no_paid_infrastructure": true', record)
 
+    def test_followup_pull_request_sync_cannot_reuse_consumed_inference_claim(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "python-multiprovider-executor.yml").read_text()
+        self.assertIn("github.event.action == 'opened' &&", workflow)
+        self.assertNotIn("github.event.action == 'synchronize' &&", workflow)
+
+    def test_future_generation_normalizes_raw_output_before_browser_validation(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "python-multiprovider-executor.yml").read_text()
+        self.assertIn("daily-practice.raw.html", workflow)
+        normalize = workflow.index("Normalize generated output and preserve raw response")
+        browser = workflow.index("Validate generated page inside the isolated browser container", normalize)
+        self.assertLess(normalize, browser)
+
+    def test_attempt_claim_records_head_sha_separately_from_merge_sha(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "python-multiprovider-executor.yml").read_text()
+        self.assertIn("PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}", workflow)
+        self.assertIn("GITHUB_MERGE_SHA: ${{ github.sha }}", workflow)
+        self.assertIn("source_commit_sha:$source_commit_sha", workflow)
+        self.assertIn("github_synthetic_merge_sha:$github_synthetic_merge_sha", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
+

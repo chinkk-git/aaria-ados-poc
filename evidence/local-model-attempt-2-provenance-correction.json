@@ -1,0 +1,18 @@
+{
+  "attempt_id": "ADOS-LOCAL-INFERENCE-002",
+  "workflow_run_id": 41474479962,
+  "workflow_run_head_sha": "37fd9444cc519788f92f665bb3913be0532a95fe",
+  "checked_out_source_commit_sha": "37fd9444cc519788f92f665bb3913be0532a95fe",
+  "github_synthetic_merge_sha": "f804ff5b0d528b817b102dc8c38c86d11ef02703",
+  "preserved_original_claim_source_sha": "f804ff5b0d528b817b102dc8c38c86d11ef02703",
+  "provenance_note": "The original claim used GITHUB_SHA, which identified the pull_request synthetic merge ref. The run head and checkout ref identify the tested PR source commit. This correction supplements rather than rewrites the original artifact.",
+  "artifact_id": 13157945712,
+  "artifact_name": "local-model-attempt-2-41474479962",
+  "artifact_sha256": "317e86e879d563dfd8957f2341887e5171b72e65fd60bd47bdc71e5959a0152f",
+  "raw_generated_output_sha256": "a462b0e4cd995c7b597d6a5763a7d7534d844c56ca1deb9cf96e77d789b817af",
+  "validated_unwrapped_output_sha256": "f6b3e7d235ad13a6862e7c579598cc0ad7a0408c0a84d5a441f0e74f59eaf250",
+  "model": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+  "model_revision": "f86cb2c1fa58255f8052cc32aeede1b7482d4361",
+  "model_sha256": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
+  "new_model_invocation": false
+}

@@ -27,7 +27,7 @@ jobs:
       github.event.pull_request.head.ref == 'experiment/python-multiprovider-executor' &&
       github.event.pull_request.user.login == 'chinkk-git'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 12
     permissions:
       contents: read
     steps:
@@ -36,15 +36,66 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - name: Run deterministic policy and adapter tests
-        run: python3 -m unittest discover -s tests -v
+      - name: Run focused review-correction tests
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_generated_html_format.py' -v
+          python3 -m unittest discover -s tests -p 'test_local_resource_limit.py' -v
+          python3 -m unittest discover -s tests -p 'test_source_provenance.py' -v
+          python3 -m unittest discover -s tests -p 'test_local_model_guard.py' -v
+          python3 scripts/normalize_generated_html.py \
+            evidence/local-model-attempt-2-raw-output.html \
+            "$RUNNER_TEMP/daily-practice-cleaned.html"
+          cmp "$RUNNER_TEMP/daily-practice-cleaned.html" \
+            evidence/local-model-attempt-2-validated.html
       - name: Check trusted browser harness syntax
         run: node --check scripts/check_local_generated_page.cjs
+      - name: Verify current checkout and PR source provenance
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ados-evidence"
+          python3 scripts/write_source_provenance.py \
+            --checked-out-sha "$(git rev-parse HEAD)" \
+            --expected-head-sha "$PR_HEAD_SHA" \
+            --merge-sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --output "$RUNNER_TEMP/ados-evidence/source-provenance.json"
+      - name: Install pinned browser harness
+        run: |
+          npm install --prefix "$RUNNER_TEMP/pw" --ignore-scripts --no-audit --no-fund playwright@1.64.1
+          docker pull mcr.microsoft.com/playwright:v1.64.1-noble
+      - name: Validate the cleaned captured artifact in isolated browser
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --init --network none --read-only \
+            --user pwuser --cap-drop ALL --security-opt no-new-privileges \
+            --security-opt "seccomp=$GITHUB_WORKSPACE/tests/playwright-seccomp.json" \
+            --memory 1536m --cpus 2 --pids-limit 128 --shm-size 256m \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --tmpfs /home/pwuser/.cache:rw,nosuid,nodev,size=128m \
+            -e NODE_PATH=/playwright/node_modules \
+            -v "$RUNNER_TEMP/pw/node_modules:/playwright/node_modules:ro" \
+            -v "$GITHUB_WORKSPACE/scripts/check_local_generated_page.cjs:/test/check.cjs:ro" \
+            -v "$GITHUB_WORKSPACE/evidence/local-model-attempt-2-validated.html:/candidate/daily-practice.html:ro" \
+            --entrypoint node mcr.microsoft.com/playwright:v1.64.1-noble /test/check.cjs \
+            | tee "$RUNNER_TEMP/ados-evidence/browser-validation.json"
+      - name: Upload focused correction evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr17-review-corrections-${{ github.run_id }}
+          path: ${{ runner.temp }}/ados-evidence/*.json
+          if-no-files-found: ignore
+          retention-days: 90
 
   local-model-one-shot:
     needs: deterministic-tests
     if: >-
-      (github.event.action == 'opened' || github.event.action == 'synchronize') &&
+      github.event.action == 'opened' &&
       github.event.pull_request.head.repo.full_name == 'chinkk-git/aaria-ados-poc' &&
       github.event.pull_request.head.ref == 'experiment/python-multiprovider-executor' &&
       github.event.pull_request.user.login == 'chinkk-git' &&
@@ -143,12 +194,17 @@ jobs:
 
       - name: Claim authorized second inference
         if: steps.one-shot-guard.outputs.second_attempt == 'true'
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_MERGE_SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
           test "$(jq -r '.second_attempt' "$RUNNER_TEMP/ados-evidence/one-shot-guard.json")" = "true"
+          checked_out_sha="$(git rev-parse HEAD)"
+          test "$checked_out_sha" = "$PR_HEAD_SHA"
           mkdir -p "$RUNNER_TEMP/ados-evidence"
-          jq -n --arg attempt_id "ADOS-LOCAL-INFERENCE-002" --arg run_id "$GITHUB_RUN_ID" --arg parent_run_id "41470648697" --arg source_sha "$GITHUB_SHA" '{attempt_id:$attempt_id,status:"CLAIMED",run_id:$run_id,parent_run_id:$parent_run_id,source_sha:$source_sha,inference_limit:1,api_requests_allowed:0}' > "$RUNNER_TEMP/ados-evidence/attempt-claim.json"
+          jq -n --arg attempt_id "ADOS-LOCAL-INFERENCE-002" --arg run_id "$GITHUB_RUN_ID" --arg parent_run_id "41470648697" --arg source_commit_sha "$checked_out_sha" --arg github_synthetic_merge_sha "$GITHUB_MERGE_SHA" '{attempt_id:$attempt_id,status:"CLAIMED",run_id:$run_id,parent_run_id:$parent_run_id,source_commit_sha:$source_commit_sha,github_synthetic_merge_sha:$github_synthetic_merge_sha,inference_limit:1,api_requests_allowed:0}' > "$RUNNER_TEMP/ados-evidence/attempt-claim.json"
           echo "SECOND_INFERENCE_CLAIMED: attempt=ADOS-LOCAL-INFERENCE-002; run=$GITHUB_RUN_ID"
 
       - name: Verify pinned runtime source and its license before model download
@@ -226,7 +282,15 @@ jobs:
         env:
           LLAMA_SERVER_BIN: ${{ runner.temp }}/llama.cpp/build/bin/llama-server
           LLAMA_CPP_EXPECTED_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
-        run: timeout --signal=TERM --kill-after=15s 16m python3 scripts/run_local_model_once.py "$RUNNER_TEMP/qwen-coder.gguf" "$RUNNER_TEMP/candidate/daily-practice.html" "$RUNNER_TEMP/ados-evidence/inference.json"
+        run: timeout --signal=TERM --kill-after=15s 16m python3 scripts/run_local_model_once.py "$RUNNER_TEMP/qwen-coder.gguf" "$RUNNER_TEMP/candidate/daily-practice.raw.html" "$RUNNER_TEMP/ados-evidence/inference.json"
+
+      - name: Normalize generated output and preserve raw response
+        if: success()
+        run: |
+          set -euo pipefail
+          python3 scripts/normalize_generated_html.py \
+            "$RUNNER_TEMP/candidate/daily-practice.raw.html" \
+            "$RUNNER_TEMP/candidate/daily-practice.html"
 
       - name: Validate generated page inside the isolated browser container
         timeout-minutes: 5
@@ -254,6 +318,8 @@ jobs:
           name: local-model-attempt-2-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/ados-evidence/*.json
+            ${{ runner.temp }}/candidate/daily-practice.raw.html
             ${{ runner.temp }}/candidate/daily-practice.html
           if-no-files-found: ignore
           retention-days: 90
+

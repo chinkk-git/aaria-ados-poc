@@ -24,7 +24,7 @@ class LocalModelGuardPolicyTests(unittest.TestCase):
     def test_model_revision_is_a_full_immutable_commit(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "scripts" / "local_model_preflight.py").read_text()
-        self.assertRegex(source, r'^MODEL_REVISION = "[0-9a-f]{40}"$')
+        self.assertRegex(source, r'(?m)^MODEL_REVISION = "[0-9a-f]{40}"$')
 
 
 if __name__ == "__main__":

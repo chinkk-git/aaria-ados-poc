@@ -8,6 +8,7 @@ permissions:
   contents: read
   issues: read
   actions: read
+  pull-requests: read
 
 concurrency:
   group: ados-poc-002-exclusive-write-lease
@@ -25,6 +26,7 @@ jobs:
       contents: write
       issues: write
       actions: read
+      pull-requests: read
     steps:
       - name: Check out the default branch
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -41,6 +43,7 @@ jobs:
           CLAIM_ID: ADOS-POC-002-ARTIFACT-HANDOFF-001
           CLAIM_MARKER: '<!-- ADOS_CLAIM:ADOS-POC-002-ARTIFACT-HANDOFF-001 -->'
           SOURCE_SHA: 0b3dde4c94f045544632fe39d3fdc4c06bd55686
+          APPROVED_PR_HEAD: 7d97769715069e1c21c2e98953afd338c0759604
           SOURCE_PATH: evidence/local-model-attempt-2-validated.html
           SOURCE_SHA256: f6b3e7d235ad13a6862e7c579598cc0ad7a0408c0a84d5a441f0e74f59eaf250
           TARGET_BRANCH: feature/ados-poc-002
@@ -52,11 +55,13 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/main"
           test "$GITHUB_ACTOR" = "chinkk-git"
 
-          # The validated source commit must be present in main before this workflow can run.
-          git fetch --no-tags origin main --quiet
-          git merge-base --is-ancestor "$SOURCE_SHA" FETCH_HEAD
-          test "$(gh api "repos/$GH_REPOSITORY/commits/$SOURCE_SHA" --jq .sha)" = "$SOURCE_SHA"
+          # Require the exact reviewed PR head to be merged, then verify the copied artifact on main.
+          pr_json="$(gh api "repos/$GH_REPOSITORY/pulls/17")"
+          test "$(jq -r '.merged' <<< "$pr_json")" = "true"
+          test "$(jq -r '.head.sha' <<< "$pr_json")" = "$APPROVED_PR_HEAD"
           test "$(gh api "repos/$GH_REPOSITORY/issues/9" --jq .title)" = "[ADOS-POC-002] Daily Practice Complete"
+          test -s "$SOURCE_PATH"
+          cp -- "$SOURCE_PATH" "$RUNNER_TEMP/daily-practice.html"
 
           # Reconcile the exact destination head and ensure the output does not already exist.
           git fetch --no-tags origin "$TARGET_BRANCH" --quiet
@@ -68,8 +73,6 @@ jobs:
           fi
 
           # Read the immutable source artifact and verify its approved digest before claiming.
-          gh api "repos/$GH_REPOSITORY/contents/$SOURCE_PATH" -f "ref=$SOURCE_SHA" --jq .content |
-            tr -d '\r\n' | base64 --decode > "$RUNNER_TEMP/daily-practice.html"
           actual_digest="$(sha256sum "$RUNNER_TEMP/daily-practice.html" | cut -d' ' -f1)"
           test "$actual_digest" = "$SOURCE_SHA256" || {
             echo "REJECTED: source artifact digest mismatch"

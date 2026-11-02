@@ -14,11 +14,16 @@ class ArtifactHandoffWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/main'", WORKFLOW)
         self.assertIn("github.actor == 'chinkk-git'", WORKFLOW)
         self.assertIn("github.repository == 'chinkk-git/aaria-ados-poc'", WORKFLOW)
+        self.assertIn("pulls/17", WORKFLOW)
+        self.assertIn("jq -r '.merged'", WORKFLOW)
+        self.assertIn("cp -- \"$SOURCE_PATH\" \"$RUNNER_TEMP/daily-practice.html\"", WORKFLOW)
+        self.assertNotIn("git merge-base --is-ancestor", WORKFLOW)
 
     def test_task_source_digest_and_scope_are_pinned(self):
         for value in (
             "ADOS-POC-002-ARTIFACT-HANDOFF-001",
             "0b3dde4c94f045544632fe39d3fdc4c06bd55686",
+            "7d97769715069e1c21c2e98953afd338c0759604",
             "f6b3e7d235ad13a6862e7c579598cc0ad7a0408c0a84d5a441f0e74f59eaf250",
             "feature/ados-poc-002",
             "657e51007d9bb7cb95d9ca3931ec45da1c34c149",

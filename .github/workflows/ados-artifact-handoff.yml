@@ -162,7 +162,24 @@ jobs:
                   raise PolicyError("source_pr_author_mismatch")
               if head_repo != "chinkk-git/aaria-ados-poc" or head_ref != "experiment/python-multiprovider-executor":
                   raise PolicyError("source_pr_head_mismatch")
-              if not live_pr_head or comparison.get("head_commit", {}).get("sha") != live_pr_head:
+              if not live_pr_head or not isinstance(comparison, dict):
+                  raise PolicyError("live_pr_comparison_invalid")
+              comparison_base = comparison.get("base_commit")
+              if not isinstance(comparison_base, dict):
+                  raise PolicyError("live_pr_comparison_base_invalid")
+              commits = comparison.get("commits")
+              total_commits = comparison.get("total_commits")
+              if not isinstance(commits, list):
+                  raise PolicyError("live_pr_comparison_commits_invalid")
+              if type(total_commits) is not int or total_commits != len(commits):
+                  raise PolicyError("live_pr_comparison_commits_incomplete")
+              if commits:
+                  if not isinstance(commits[-1], dict):
+                      raise PolicyError("live_pr_comparison_head_invalid")
+                  comparison_head = commits[-1].get("sha")
+              else:
+                  comparison_head = comparison_base.get("sha")
+              if comparison_head != live_pr_head:
                   raise PolicyError("live_pr_head_mismatch")
               if comparison.get("base_commit", {}).get("sha") != source_sha:
                   raise PolicyError("reviewed_source_base_mismatch")

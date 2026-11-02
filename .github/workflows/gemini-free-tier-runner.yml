@@ -132,7 +132,7 @@ jobs:
         run: |
           set -euo pipefail
           npm install --no-save --package-lock=false playwright@1.64.1
-          npx playwright install --with-deps chromium
+          docker pull mcr.microsoft.com/playwright:v1.64.1-noble
 
       - name: Make exactly one Gemini API request
         env:
@@ -233,7 +233,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          timeout --signal=TERM --kill-after=5s 90s node scripts/validate_gemini_html.mjs "$CANDIDATE_PATH"
+          install -d -m 0755 "$RUNNER_TEMP/gemini-candidate"
+          install -m 0644 "$CANDIDATE_PATH" "$RUNNER_TEMP/gemini-candidate/daily-practice.html"
+          timeout --signal=TERM --kill-after=5s 90s docker run --rm \
+            --network=none \
+            --user=pwuser \
+            --security-opt seccomp="$GITHUB_WORKSPACE/scripts/chromium-seccomp.json" \
+            --volume "$GITHUB_WORKSPACE/scripts:/workspace/scripts:ro" \
+            --volume "$GITHUB_WORKSPACE/node_modules:/workspace/node_modules:ro" \
+            --volume "$RUNNER_TEMP/gemini-candidate:/candidate:ro" \
+            --workdir /workspace \
+            --env HOME=/home/pwuser \
+            mcr.microsoft.com/playwright:v1.64.1-noble \
+            node scripts/validate_gemini_html.mjs /candidate/daily-practice.html
 
       - name: Save successful synthetic output as text evidence
         if: success()

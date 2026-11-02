@@ -11,6 +11,16 @@ import provider_catalog as pc
 
 
 class ProviderCatalogTests(unittest.TestCase):
+    def test_machine_readable_status_matches_fail_closed_policy_evidence(self):
+        stored = json.loads((Path(__file__).resolve().parents[1] / "providers" / "status.json").read_text())
+        runtime = pc.default_status_records()
+        self.assertEqual(set(stored), set(runtime))
+        for name, record in runtime.items():
+            self.assertEqual(stored[name]["eligibility"], record.eligibility.value)
+            self.assertEqual(stored[name]["model"], record.model)
+            self.assertEqual(stored[name]["cost_authorized_usd"], 0.0)
+        self.assertEqual(stored["openrouter"]["last_verified_at"], "2026-11-02T12:56:02Z")
+
     def test_status_records_fail_closed_and_never_claim_unknown_quota(self):
         records = pc.default_status_records()
         self.assertEqual(records["openrouter"].eligibility, pc.EligibilityState.QUOTA_EXHAUSTED)

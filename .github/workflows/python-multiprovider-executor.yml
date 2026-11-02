@@ -91,7 +91,7 @@ jobs:
               jobs_file="$RUNNER_TEMP/ados-prior-jobs-$prior_id.json"
               gh api --paginate --slurp "repos/$GH_REPOSITORY/actions/runs/$prior_id/jobs?per_page=100" > "$jobs_file"
               safe_resume="$(jq -r \
-                '[.[].jobs[] | select(.name == "local-model-one-shot") | .steps[] | select(.name == "Download one checksum-pinned local model" or .name == "Make exactly one local coding request") | .conclusion] as $steps | ($steps | length) == 2 and ($steps | all(. == "skipped"))' \
+                '[.[].jobs[] | select(.name == "local-model-one-shot")] as $jobs | ($jobs | length) == 1 and ($jobs[0].conclusion == "skipped" or ([$jobs[0].steps[]? | select(.name == "Download one checksum-pinned local model" or .name == "Make exactly one local coding request") | .conclusion] as $steps | ($steps | length) == 2 and ($steps | all(. == "skipped"))))' \
                 "$jobs_file")"
               test "$safe_resume" = "true" || {
                 echo "LOCAL_MODEL_BLOCKED: prior run $prior_id may have downloaded weights or invoked inference"; exit 1;

@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import unittest
 
 
@@ -10,11 +11,14 @@ class LocalModelGuardPolicyTests(unittest.TestCase):
         self.assertIn("select((.id | tostring) != $current)", workflow)
         self.assertIn("repos/$GH_REPOSITORY/actions/runs/$prior_id/jobs?per_page=100", workflow)
         self.assertIn('($steps | length) == 2 and ($steps | all(. == "skipped"))', workflow)
+        self.assertIn('$jobs[0].conclusion == "skipped"', workflow)
+        self.assertIn('($jobs | length) == 1', workflow)
 
     def test_guard_has_no_arbitrary_prior_run_count_cutoff(self):
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "python-multiprovider-executor.yml").read_text()
-        self.assertNotIn("prior_count >", workflow)
+        self.assertIn("if (( prior_count > 0 )); then", workflow)
+        self.assertNotRegex(workflow, r"prior_count\s*(?:>=|>)\s*(?!0(?:\D|$))\d+")
         self.assertIn('test "$CURRENT_ATTEMPT" = "1"', workflow)
 
 

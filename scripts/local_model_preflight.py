@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 
 MODEL_REPO = "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF"
-MODEL_REVISION = "bf1da6ca8f02b444067db175f02a14e74f49c5c0"
+MODEL_REVISION = "ebb2015119c907b064c512bf053e945850b5875f"
 MODEL_FILENAME = "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"
 MODEL_SIZE_BYTES = 491_400_064
 MODEL_SHA256 = "1d9614638d18024d0fbb36575a15f1302a3adf044df10345688ec4f6e1c4ff32"

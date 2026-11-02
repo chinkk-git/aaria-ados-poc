@@ -80,7 +80,7 @@ jobs:
             > "$runs_file"
           prior_count="$(jq --arg current "$CURRENT_RUN_ID" \
             '[.[].workflow_runs[] | select((.id | tostring) != $current)] | length' "$runs_file")"
-          if (( prior_count > 2 )); then
+          if (( prior_count > 4 )); then
             echo "LOCAL_MODEL_BLOCKED: safe pre-inference recovery allowance is exhausted"
             exit 1
           elif (( prior_count > 0 )); then

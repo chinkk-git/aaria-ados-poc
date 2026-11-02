@@ -61,7 +61,10 @@ def verify_model_card_metadata(timeout: float = 20.0) -> dict[str, object]:
     if not isinstance(data, dict) or data.get("sha") != MODEL_REVISION:
         raise RuntimeError("model_revision_metadata_mismatch")
     card = data.get("cardData")
-    if not isinstance(card, dict) or card.get("license") != "apache-2.0":
+    license_tags = data.get("tags")
+    tagged_license = isinstance(license_tags, list) and "license:apache-2.0" in license_tags
+    card_license = isinstance(card, dict) and card.get("license") == "apache-2.0"
+    if not (card_license or tagged_license):
         raise RuntimeError("model_license_metadata_mismatch")
     siblings = data.get("siblings")
     if not isinstance(siblings, list) or not any(

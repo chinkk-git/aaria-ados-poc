@@ -38,6 +38,32 @@ class LocalModelMetadataTests(unittest.TestCase):
         self.assertEqual(proof["model_revision"], preflight.MODEL_REVISION)
         self.assertEqual(proof["model_license"], "Apache-2.0")
 
+    def test_license_tag_is_valid_pinned_metadata_when_card_field_is_absent(self):
+        response = MagicMock()
+        response.geturl.return_value = "https://huggingface.co/api/models/pinned"
+        response.__enter__.return_value = response
+        response.read.return_value = (
+            '{"sha":"' + preflight.MODEL_REVISION + '",'
+            '"tags":["text-generation","license:apache-2.0"],'
+            '"siblings":[{"rfilename":"' + preflight.MODEL_FILENAME + '"}]}'
+        ).encode()
+        with patch.object(preflight.urllib.request, "urlopen", return_value=response):
+            proof = preflight.verify_model_card_metadata()
+        self.assertEqual(proof["model_license"], "Apache-2.0")
+
+    def test_unverified_license_tag_still_blocks(self):
+        response = MagicMock()
+        response.geturl.return_value = "https://huggingface.co/api/models/pinned"
+        response.__enter__.return_value = response
+        response.read.return_value = (
+            '{"sha":"' + preflight.MODEL_REVISION + '",'
+            '"tags":["text-generation"],'
+            '"siblings":[{"rfilename":"' + preflight.MODEL_FILENAME + '"}]}'
+        ).encode()
+        with patch.object(preflight.urllib.request, "urlopen", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "model_license_metadata_mismatch"):
+                preflight.verify_model_card_metadata()
+
 
 if __name__ == "__main__":
     unittest.main()

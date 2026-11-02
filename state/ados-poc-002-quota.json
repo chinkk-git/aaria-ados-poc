@@ -1,0 +1,14 @@
+{
+  "task_id": "ADOS-POC-002",
+  "state": "BLOCKED_QUOTA",
+  "evidence": {
+    "provider": "OpenRouter",
+    "error_class": "free-models-per-day",
+    "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    "workflow_run_id": 41376777156,
+    "workflow_run_url": "https://github.com/chinkk-git/aaria-ados-poc/actions/runs/41376777156",
+    "observed_at": "2026-11-02T02:17:34.8426741Z"
+  },
+  "paid_fallback": false,
+  "remaining_request_count": null
+}

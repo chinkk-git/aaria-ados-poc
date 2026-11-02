@@ -17,7 +17,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, sys, urllib.request, urllib.error
+          import json, os, re, sys, urllib.request, urllib.error
           key = os.environ.get("OPENROUTER_API_KEY", "")
           if not key:
               print("BLOCKED: OPENROUTER_API_KEY secret is unavailable.")
@@ -38,6 +38,7 @@ jobs:
           )
           try:
               with urllib.request.urlopen(request, timeout=45) as response:
+                  http_status = response.status
                   data = json.load(response)
           except urllib.error.HTTPError as error:
               # Never print provider error body or request headers.
@@ -46,9 +47,34 @@ jobs:
           except Exception:
               print("BLOCKED: OpenRouter connectivity or response error.")
               sys.exit(1)
-          choices = data.get("choices") or []
-          message = (choices[0].get("message") or {}) if choices else {}
-          if isinstance(message.get("content"), str) and message["content"].strip():
+
+          choices_value = data.get("choices")
+          choices = choices_value if isinstance(choices_value, list) else []
+          choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+          message_value = choice.get("message")
+          message = message_value if isinstance(message_value, dict) else {}
+          content = message.get("content")
+          model = data.get("model")
+          finish_reason = choice.get("finish_reason")
+
+          def safe_metadata(value):
+              if value is None:
+                  return "missing"
+              return re.sub(r"[^A-Za-z0-9_.:-]", "?", str(value))[:80]
+
+          content_length = len(content) if isinstance(content, str) else "n/a"
+          print(
+              "DIAGNOSTIC: http_status={}; model={}; choices={}; "
+              "finish_reason={}; content_type={}; content_length={}".format(
+                  http_status,
+                  safe_metadata(model),
+                  len(choices),
+                  safe_metadata(finish_reason),
+                  type(content).__name__,
+                  content_length
+              )
+          )
+          if isinstance(content, str) and content.strip():
               print("VERIFIED: Free-model API returned a nonempty response.")
           else:
               print("BLOCKED: No nonempty model response.")

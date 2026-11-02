@@ -190,7 +190,7 @@ def default_status_records() -> dict[str, ProviderStatusRecord]:
             auth_method="x-goog-api-key", secret="GEMINI_API_KEY",
             note="Public pricing lists free and paid tiers; repository key project billing is not observable here."),
         ProviderStatusRecord("openrouter", "openrouter/free", EligibilityState.QUOTA_EXHAUSTED,
-            None, "EXHAUSTED", "used=52; limit=50; remaining=0",
+            "2026-11-02T12:56:02Z", "EXHAUSTED", "used=52; limit=50; remaining=0",
             "workflow run 41448677323 in chinkk-git/aaria-ados-poc",
             "QUOTA_EXHAUSTED", False,
             ProviderCapabilities(True, False, None, 2048, "existing route and failed task evidence"),

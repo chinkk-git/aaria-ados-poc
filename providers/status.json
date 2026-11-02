@@ -91,7 +91,7 @@
     "cost_authorized_usd": 0.0,
     "eligibility": "QUOTA_EXHAUSTED",
     "last_failure_classification": "QUOTA_EXHAUSTED",
-    "last_verified_at": null,
+    "last_verified_at": "2026-11-02T12:56:02Z",
     "model": "openrouter/free",
     "note": "Last durable repository metadata run recorded 52 used against a 50-request limit; no reset was reported.",
     "provider": "openrouter",

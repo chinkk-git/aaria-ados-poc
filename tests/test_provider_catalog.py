@@ -15,6 +15,7 @@ class ProviderCatalogTests(unittest.TestCase):
         records = pc.default_status_records()
         self.assertEqual(records["openrouter"].eligibility, pc.EligibilityState.QUOTA_EXHAUSTED)
         self.assertEqual(records["openrouter"].quota_status, "EXHAUSTED")
+        self.assertEqual(records["openrouter"].last_verified_at, "2026-11-02T12:56:02Z")
         self.assertEqual(records["groq"].eligibility, pc.EligibilityState.BILLING_UNVERIFIED)
         self.assertEqual(records["nvidia_nim"].eligibility, pc.EligibilityState.AUTH_UNAVAILABLE)
         self.assertEqual(records["github_models"].eligibility, pc.EligibilityState.DISABLED)

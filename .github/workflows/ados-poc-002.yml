@@ -131,6 +131,7 @@ jobs:
           trap 'rm -rf .ados-policy' EXIT
           test -s daily-practice.html || { echo "REJECTED: empty output"; exit 1; }
           node .ados-policy/scripts/check_daily_practice.js daily-practice.html
+          rm -rf .ados-policy
           changed="$(git status --porcelain | sed 's/^...//')"
           test "$changed" = "daily-practice.html" || { echo "REJECTED: unexpected changes"; git status --short; exit 1; }
           echo "VERIFIED: only daily-practice.html changed and initial, click, and reload behavior passed"

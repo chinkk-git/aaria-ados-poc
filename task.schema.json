@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chinkk-git/aaria-ados-poc/task.schema.json",
+  "title": "ADOS task manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "title", "state", "branch", "accountableWorker", "writeScope", "maxRetries", "acceptanceCriteria", "experiments"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^ADOS-POC-[0-9]{3}$"},
+    "title": {"type": "string", "minLength": 1},
+    "state": {"enum": ["DEFINED", "APPROVED", "READY", "CLAIMED", "BUILDING", "PR_OPEN", "VERIFYING", "REVIEWING", "ELIGIBLE", "COMPLETE", "BLOCKED", "FAILED", "CANCELLED", "SUPERSEDED"]},
+    "branch": {"type": "string", "pattern": "^feature/[a-zA-Z0-9._/-]+$"},
+    "accountableWorker": {"type": "string", "minLength": 1},
+    "writeScope": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "maxRetries": {"type": "integer", "minimum": 0, "maximum": 2},
+    "acceptanceCriteria": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "experiments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["E01", "E02", "E03", "E04"],
+      "properties": {
+        "E01": {"enum": ["BLOCKED", "NOT_RUN", "PASS", "FAIL"]},
+        "E02": {"enum": ["NOT_RUN", "PASS", "FAIL"]},
+        "E03": {"enum": ["NOT_RUN", "PASS", "FAIL"]},
+        "E04": {"enum": ["NOT_RUN", "PASS", "FAIL"]}
+      }
+    }
+  }
+}

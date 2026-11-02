@@ -1,9 +1,20 @@
 name: ADOS POC 002 isolated dispatch
-run-name: ADOS-POC-002 issue-${{ github.event.issue.number }}
+run-name: ADOS-POC-002 ${{ github.event_name == 'issues' && format('issue-{0}', github.event.issue.number) || format('resume-issue-{0}', inputs.issue_number) }}
 on:
   issues:
     types: [opened]
   workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Existing ADOS-POC-002 issue to resume
+        required: true
+        type: choice
+        options: ['9']
+      resume_failed_run:
+        description: Exact failed run to resume once
+        required: true
+        type: choice
+        options: ['41376777156']
 
 permissions:
   contents: read
@@ -16,23 +27,29 @@ jobs:
   execute:
     if: >-
       github.actor == 'chinkk-git' &&
-      (github.event_name == 'workflow_dispatch' ||
-      (github.event.issue.user.login == 'chinkk-git' &&
-      github.event.issue.title == '[ADOS-POC-002] Daily Practice Complete'))
+      ((github.event_name == 'issues' &&
+      github.event.issue.user.login == 'chinkk-git' &&
+      github.event.issue.title == '[ADOS-POC-002] Daily Practice Complete') ||
+      (github.event_name == 'workflow_dispatch' &&
+      inputs.issue_number == '9' &&
+      inputs.resume_failed_run == '41376777156'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
       issues: read
+      actions: read
     steps:
       - name: Checkout exclusive task branch
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: feature/ados-poc-002
           persist-credentials: false
-      - name: Deterministic duplicate and scope preflight
+
+      - name: Enforce one-time resume and task scope
         env:
           GH_TOKEN: ${{ github.token }}
+          RESUME_FAILED_RUN: ${{ inputs.resume_failed_run }}
         shell: bash
         run: |
           set -euo pipefail
@@ -40,12 +57,21 @@ jobs:
           test -z "$(git status --porcelain)" || { echo "REJECTED: dirty branch"; exit 1; }
           existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-poc-002" --state all --json number --jq 'length')"
           test "$existing" = "0" || { echo "REJECTED: existing PR"; exit 1; }
-          echo "VERIFIED: exclusive branch ready"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            test "$RESUME_FAILED_RUN" = "41376777156" || { echo "REJECTED: resume must name the exact failed run"; exit 1; }
+            failed_run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RESUME_FAILED_RUN")"
+            printf '%s' "$failed_run" | jq -e '.id == 41376777156 and .event == "issues" and .conclusion == "failure"' >/dev/null || { echo "REJECTED: prior run is not the verified failed issue dispatch"; exit 1; }
+            previous_manual="$(gh run list --workflow .github/workflows/ados-poc-002.yml --event workflow_dispatch --limit 100 --json databaseId --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID)] | length")"
+            test "$previous_manual" = "0" || { echo "REJECTED: one-time resume was already used"; exit 1; }
+          fi
+          echo "VERIFIED: exclusive branch ready; manual resume allowance is unused"
+
       - name: Install pinned executor
         run: |
           set -euo pipefail
           npm install --global @opencode/cli@2.2.5
           opencode --version
+
       - name: Configure executor permissions
         shell: bash
         run: |
@@ -69,40 +95,19 @@ jobs:
             }
           }
           JSON
-      - name: Fail-closed free-model quota preflight
+
+      - name: Run OpenCode on the Gemini free tier
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "${OPENROUTER_API_KEY:-}" || { echo "BLOCKED_QUOTA: missing key"; exit 1; }
-          python3 - <<'PY'
-          import json, os, urllib.request, urllib.error, sys
-          req=urllib.request.Request('https://openrouter.ai/api/v1/key',headers={'Authorization':'Bearer '+os.environ['OPENROUTER_API_KEY']})
-          try:
-              with urllib.request.urlopen(req,timeout=15) as response:
-                  payload=json.load(response)
-          except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError,ValueError) as exc:
-              print('BLOCKED_QUOTA: quota status unavailable ('+type(exc).__name__+')')
-              sys.exit(1)
-          quota=(payload.get('data') or {}).get('free_model_daily_requests')
-          remaining=quota.get('remaining') if isinstance(quota,dict) else None
-          if type(remaining) is not int or remaining < 5:
-              print('BLOCKED_QUOTA: insufficient or unverified free requests')
-              sys.exit(1)
-          print('VERIFIED: free-model daily quota threshold met; model-specific limits still apply')
-          PY
-      - name: Run OpenCode free-model worker
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail
           trap 'rm -f opencode.json' EXIT
-          test -n "$OPENROUTER_API_KEY" || { echo "BLOCKED: missing secret"; exit 1; }
+          test -n "$GOOGLE_GENERATIVE_AI_API_KEY" || { echo "BLOCKED: missing GEMINI_API_KEY secret"; exit 1; }
           opencode run --standalone --auto \
-            --model openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free \
-            "ADOS-POC-002. Create ONLY daily-practice.html: a self-contained accessible HTML page with a heading Daily Practice, a button Mark Complete, and a status indicator initially Not completed. Clicking the button changes status to Completed. Reload resets status to Not completed (no localStorage). Use no external dependencies, personal data, network calls, or other files. Do not edit index.html."
+            --model google/gemini-2.5-flash-lite \
+            "ADOS-POC-002. Create ONLY daily-practice.html: a self-contained accessible HTML page with a heading Daily Practice, a button Mark Complete, and a status indicator initially Not completed. Clicking the button changes status to Completed. Reload resets status to Not completed (no localStorage). Use no external dependencies, personal data, network calls, or other files. Do not edit index.html. Do not retry on provider errors or select a paid model."
+
       - name: Enforce single-file output
         shell: bash
         run: |
@@ -110,6 +115,7 @@ jobs:
           test "$(git status --porcelain | sed 's/^...//')" = "daily-practice.html" || { echo "REJECTED: unexpected changes"; git status --short; exit 1; }
           test -s daily-practice.html || { echo "REJECTED: empty output"; exit 1; }
           echo "VERIFIED: only daily-practice.html changed"
+
       - name: Preserve commit checkpoint
         env:
           GH_TOKEN: ${{ github.token }}

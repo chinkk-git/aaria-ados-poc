@@ -1,0 +1,328 @@
+name: Python multi-provider executor experiment
+run-name: ADOS local model feasibility — ${{ github.event.pull_request.number }}
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [main]
+    paths:
+      - '.github/workflows/python-multiprovider-executor.yml'
+      - '.github/workflows/ados-artifact-handoff.yml'
+      - 'scripts/**'
+      - 'schemas/**'
+      - 'tasks/**'
+      - 'tests/**'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: python-multiprovider-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  deterministic-tests:
+    if: >-
+      github.event.pull_request.head.repo.full_name == 'chinkk-git/aaria-ados-poc' &&
+      github.event.pull_request.head.ref == 'experiment/python-multiprovider-executor' &&
+      github.event.pull_request.user.login == 'chinkk-git'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the reviewed experiment source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Run focused review-correction tests
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_generated_html_format.py' -v
+          python3 -m unittest discover -s tests -p 'test_local_resource_limit.py' -v
+          python3 -m unittest discover -s tests -p 'test_source_provenance.py' -v
+          python3 -m unittest discover -s tests -p 'test_local_model_guard.py' -v
+          python3 -m unittest discover -s tests -p 'test_artifact_handoff_workflow.py' -v
+          ruby -e 'require "yaml"; YAML.parse_file(".github/workflows/ados-artifact-handoff.yml")'
+          python3 scripts/normalize_generated_html.py \
+            evidence/local-model-attempt-2-raw-output.html \
+            "$RUNNER_TEMP/daily-practice-cleaned.html"
+          cmp "$RUNNER_TEMP/daily-practice-cleaned.html" \
+            evidence/local-model-attempt-2-validated.html
+      - name: Check trusted browser harness syntax
+        run: node --check scripts/check_local_generated_page.cjs
+      - name: Verify current checkout and PR source provenance
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ados-evidence"
+          python3 scripts/write_source_provenance.py \
+            --checked-out-sha "$(git rev-parse HEAD)" \
+            --expected-head-sha "$PR_HEAD_SHA" \
+            --merge-sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --output "$RUNNER_TEMP/ados-evidence/source-provenance.json"
+      - name: Install pinned browser harness
+        run: |
+          npm install --prefix "$RUNNER_TEMP/pw" --ignore-scripts --no-audit --no-fund playwright@1.64.1
+          docker pull mcr.microsoft.com/playwright:v1.64.1-noble
+      - name: Validate the cleaned captured artifact in isolated browser
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --init --network none --read-only \
+            --user pwuser --cap-drop ALL --security-opt no-new-privileges \
+            --security-opt "seccomp=$GITHUB_WORKSPACE/tests/playwright-seccomp.json" \
+            --memory 1536m --cpus 2 --pids-limit 128 --shm-size 256m \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --tmpfs /home/pwuser/.cache:rw,nosuid,nodev,size=128m \
+            -e NODE_PATH=/playwright/node_modules \
+            -v "$RUNNER_TEMP/pw/node_modules:/playwright/node_modules:ro" \
+            -v "$GITHUB_WORKSPACE/scripts/check_local_generated_page.cjs:/test/check.cjs:ro" \
+            -v "$GITHUB_WORKSPACE/evidence/local-model-attempt-2-validated.html:/candidate/daily-practice.html:ro" \
+            --entrypoint node mcr.microsoft.com/playwright:v1.64.1-noble /test/check.cjs \
+            | tee "$RUNNER_TEMP/ados-evidence/browser-validation.json"
+      - name: Upload focused correction evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr17-review-corrections-${{ github.run_id }}
+          path: ${{ runner.temp }}/ados-evidence/*.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  local-model-one-shot:
+    needs: deterministic-tests
+    if: >-
+      github.event.action == 'opened' &&
+      github.event.pull_request.head.repo.full_name == 'chinkk-git/aaria-ados-poc' &&
+      github.event.pull_request.head.ref == 'experiment/python-multiprovider-executor' &&
+      github.event.pull_request.user.login == 'chinkk-git' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out the exact task revision without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Enforce a durable one-inference limit
+        id: one-shot-guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          CURRENT_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "chinkk-git/aaria-ados-poc"
+          test "$HEAD_BRANCH" = "experiment/python-multiprovider-executor"
+          test "$CURRENT_ATTEMPT" = "1"
+          runs_file="$RUNNER_TEMP/ados-workflow-runs.json"
+          gh api --paginate --slurp \
+            "repos/$GH_REPOSITORY/actions/workflows/python-multiprovider-executor.yml/runs?branch=experiment%2Fpython-multiprovider-executor&per_page=100" \
+            > "$runs_file"
+          prior_count="$(jq --arg current "$CURRENT_RUN_ID" \
+            '[.[].workflow_runs[] | select((.id | tostring) != $current)] | length' "$runs_file")"
+          second_attempt="false"
+          if jq -e '.attempt_id == "ADOS-LOCAL-INFERENCE-002" and .status == "OWNER_AUTHORIZED" and .authorization_count == 1 and .max_inference_requests == 1 and .external_api_requests_allowed == 0 and .no_paid_infrastructure == true and .no_automatic_retries == true and .preserve_original_one_shot_guard == true and .parent_attempt.workflow_run_id == 41470648697 and .parent_attempt.commit_sha == "157ba9063292d9e9451b1ebcc6649c95f376a6e5" and .parent_attempt.generated_output_sha256 == "f2891a03a3a3f7408107e1014d1f2643c0f186dc52e4dde2a4576ea9e2293185" and .model.repo == "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF" and .model.revision == "f86cb2c1fa58255f8052cc32aeede1b7482d4361" and .model.sha256 == "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046"' tasks/local-model-attempt-2.json >/dev/null; then
+            second_attempt="true"
+          fi
+          if (( prior_count > 0 )); then
+            while IFS= read -r prior_id; do
+              prior_run="$(gh api "repos/$GH_REPOSITORY/actions/runs/$prior_id")"
+              prior_identity="$(jq -r '.event + ":" + .conclusion + ":" + .head_branch' <<< "$prior_run")"
+              case "$prior_identity" in
+                "pull_request:failure:experiment/python-multiprovider-executor"|"pull_request:cancelled:experiment/python-multiprovider-executor") ;;
+                *) echo "LOCAL_MODEL_BLOCKED: prior run $prior_id was not a safe pre-inference stop"; exit 1 ;;
+              esac
+              jobs_file="$RUNNER_TEMP/ados-prior-jobs-$prior_id.json"
+              gh api --paginate --slurp "repos/$GH_REPOSITORY/actions/runs/$prior_id/jobs?per_page=100" > "$jobs_file"
+              if [[ "$second_attempt" == "true" ]] && jq -e '[.[].jobs[] | select(.name == "local-model-one-shot") | .steps[]? | select(.name == "Claim authorized second inference") | select(.conclusion == "success" or .status == "in_progress")] | length > 0' "$jobs_file" >/dev/null; then
+                echo "LOCAL_MODEL_ATTEMPT_BLOCKED: second inference already claimed in run $prior_id"; exit 1
+              fi
+              safe_resume="$(jq -r \
+                '[.[].jobs[] | select(.name == "local-model-one-shot")] as $jobs | if ($jobs | length) == 0 then true elif ($jobs | length) != 1 then false elif $jobs[0].conclusion == "skipped" then true else ([$jobs[0].steps[]? | select(.name == "Download one checksum-pinned local model" or .name == "Make exactly one local coding request") | .conclusion] as $steps | ($steps | length) == 2 and ($steps | all(. == "skipped"))) end' \
+                "$jobs_file")"
+              if [[ "$safe_resume" != "true" && "$prior_id" == "41469249556" ]] &&
+                 [[ "$(jq -r '.head_sha' <<< "$prior_run")" == "8b81750df10d96aa4ef1cf2c0a48e82fcd5b3176" ]]; then
+                prior_download_state="$(jq -r '[.[].jobs[] | select(.name == "local-model-one-shot") | .steps[]? | select(.name == "Download one checksum-pinned local model" or .name == "Make exactly one local coding request") | .conclusion] | join(":")' "$jobs_file")"
+                if [[ "$prior_download_state" == "failure:skipped" ]] &&
+                   prior_log="$(gh run view "$prior_id" --log-failed 2>/dev/null)" &&
+                   grep -Fq 'LOCAL_MODEL_DOWNLOAD: BLOCKED; code=model_redirect_host_not_allowlisted' <<< "$prior_log"; then
+                  safe_resume="true"
+                  echo "SAFE_RECOVERY: run $prior_id failed before reading model bytes; inference remained skipped"
+                fi
+              fi
+              if [[ "$safe_resume" != "true" && "$second_attempt" == "true" && "$prior_id" == "41470648697" ]] &&
+                 [[ "$(jq -r '.head_sha' <<< "$prior_run")" == "157ba9063292d9e9451b1ebcc6649c95f376a6e5" ]]; then
+                parent_state="$(jq -r '[.[].jobs[] | select(.name == "local-model-one-shot") | .steps[]? | select(.name == "Download one checksum-pinned local model" or .name == "Make exactly one local coding request" or .name == "Validate generated page inside the isolated browser container") | .conclusion] | join(":")' "$jobs_file")"
+                artifact_present="$(gh api "repos/$GH_REPOSITORY/actions/runs/41470648697/artifacts" | jq -r '[.artifacts[] | select(.id == 13155402065)] | length == 1')"
+                if [[ "$parent_state" == "success:success:failure" && "$artifact_present" == "true" ]] &&
+                   [[ "$(sha256sum evidence/local-model-attempt-1-rejected.html | cut -d' ' -f1)" == "f2891a03a3a3f7408107e1014d1f2643c0f186dc52e4dde2a4576ea9e2293185" ]] &&
+                   jq -e '.attempt_id == "ADOS-LOCAL-INFERENCE-001" and .workflow_run_id == 41470648697 and (.browser_validation | startswith("FAIL:"))' evidence/local-model-attempt-1.json >/dev/null; then
+                  safe_resume="true"
+                  echo "SECOND_INFERENCE_PARENT_VERIFIED: original failed output, browser rejection, and consumed first attempt are preserved"
+                fi
+              fi
+              test "$safe_resume" = "true" || {
+                echo "LOCAL_MODEL_BLOCKED: prior run $prior_id may have downloaded weights or invoked inference"; exit 1;
+              }
+            done < <(jq -r --arg current "$CURRENT_RUN_ID" \
+              '.[].workflow_runs[] | select((.id | tostring) != $current) | .id' "$runs_file")
+            if [[ "$second_attempt" == "true" ]]; then
+              echo "SECOND_INFERENCE_AUTHORIZED: all earlier runs reconciled; the separate attempt is claimed once"
+            else
+              echo "SAFE_RECOVERY: all $prior_count prior runs stopped before model download and inference; one attempt remains"
+            fi
+          fi
+          mkdir -p "$RUNNER_TEMP/ados-evidence"
+          preflight_recovery="false"
+          if [[ "$second_attempt" != "true" && "$prior_count" -gt "0" ]]; then preflight_recovery="true"; fi
+          printf '{"one_shot_guard":"PASS","prior_workflow_runs":%s,"safe_preflight_recovery":%s,"run_id":%s,"attempt":%s,"second_attempt":%s}\n' \
+            "$prior_count" "$preflight_recovery" \
+            "$CURRENT_RUN_ID" "$CURRENT_ATTEMPT" "$second_attempt" > "$RUNNER_TEMP/ados-evidence/one-shot-guard.json"
+          echo "second_attempt=$second_attempt" >> "$GITHUB_OUTPUT"
+
+      - name: Claim authorized second inference
+        if: steps.one-shot-guard.outputs.second_attempt == 'true'
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_MERGE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(jq -r '.second_attempt' "$RUNNER_TEMP/ados-evidence/one-shot-guard.json")" = "true"
+          checked_out_sha="$(git rev-parse HEAD)"
+          test "$checked_out_sha" = "$PR_HEAD_SHA"
+          mkdir -p "$RUNNER_TEMP/ados-evidence"
+          jq -n --arg attempt_id "ADOS-LOCAL-INFERENCE-002" --arg run_id "$GITHUB_RUN_ID" --arg parent_run_id "41470648697" --arg source_commit_sha "$checked_out_sha" --arg github_synthetic_merge_sha "$GITHUB_MERGE_SHA" '{attempt_id:$attempt_id,status:"CLAIMED",run_id:$run_id,parent_run_id:$parent_run_id,source_commit_sha:$source_commit_sha,github_synthetic_merge_sha:$github_synthetic_merge_sha,inference_limit:1,api_requests_allowed:0}' > "$RUNNER_TEMP/ados-evidence/attempt-claim.json"
+          echo "SECOND_INFERENCE_CLAIMED: attempt=ADOS-LOCAL-INFERENCE-002; run=$GITHUB_RUN_ID"
+
+      - name: Verify pinned runtime source and its license before model download
+        env:
+          LLAMA_CPP_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/llama.cpp"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C "$source_dir" fetch --depth 1 origin "$LLAMA_CPP_COMMIT"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$LLAMA_CPP_COMMIT"
+          test -s "$source_dir/LICENSE"
+          grep -Fq "MIT License" "$source_dir/LICENSE"
+          echo "LLAMA_CPP_SOURCE: PASS; commit=$LLAMA_CPP_COMMIT; license=MIT"
+          cmake --version
+          cmake -S "$source_dir" -B "$source_dir/build" \
+            -DGGML_CUDA=OFF -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+          cmake --build "$source_dir/build" --target llama-server -j 4
+          test -x "$source_dir/build/bin/llama-server"
+          mkdir -p "$RUNNER_TEMP/ados-evidence"
+          printf '{"runtime_commit":"%s","runtime_license":"MIT","runtime_build":"PASS"}\n' \
+            "$LLAMA_CPP_COMMIT" > "$RUNNER_TEMP/ados-evidence/runtime.json"
+
+      - name: Install the fixed Playwright harness and pull pinned browser image
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/pw" --ignore-scripts --no-audit --no-fund playwright@1.64.1
+          docker pull mcr.microsoft.com/playwright:v1.64.1-noble
+
+      - name: Verify runner capacity, pinned model metadata, and zero-cost license
+        run: python3 scripts/local_model_preflight.py "$RUNNER_TEMP/ados-evidence/preflight.json"
+
+      - name: Verify the sandbox rejects no-op and persistent output
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_browser_check() {
+            candidate="$1"
+            docker run --rm --init --network none --read-only \
+              --user pwuser --cap-drop ALL --security-opt no-new-privileges \
+              --security-opt "seccomp=$GITHUB_WORKSPACE/tests/playwright-seccomp.json" \
+              --memory 1536m --cpus 2 --pids-limit 128 --shm-size 256m \
+              --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+              --tmpfs /home/pwuser/.cache:rw,nosuid,nodev,size=128m \
+              -e NODE_PATH=/playwright/node_modules \
+              -v "$RUNNER_TEMP/pw/node_modules:/playwright/node_modules:ro" \
+              -v "$GITHUB_WORKSPACE/scripts/check_local_generated_page.cjs:/test/check.cjs:ro" \
+              -v "$GITHUB_WORKSPACE/tests/fixtures:/fixtures:ro" \
+              -v "$GITHUB_WORKSPACE/tests/fixtures/$candidate:/candidate/daily-practice.html:ro" \
+              --entrypoint node mcr.microsoft.com/playwright:v1.64.1-noble /test/check.cjs
+          }
+          run_browser_check daily-practice-valid.html
+          if run_browser_check daily-practice-noop.html; then
+            echo "SANDBOX_POLICY_FAILURE: no-op fixture passed"
+            exit 1
+          fi
+          if run_browser_check daily-practice-persistent.html; then
+            echo "SANDBOX_POLICY_FAILURE: persistent-state fixture passed"
+            exit 1
+          fi
+          printf '{"valid_fixture":"PASS","no_op_fixture":"REJECTED","persistent_fixture":"REJECTED"}\n' \
+            > "$RUNNER_TEMP/ados-evidence/sandbox-policy.json"
+
+      - name: Download one checksum-pinned local model
+        run: python3 scripts/download_local_model.py "$RUNNER_TEMP/qwen-coder.gguf" "$RUNNER_TEMP/ados-evidence/download.json"
+
+      - name: Make exactly one local coding request
+        env:
+          LLAMA_SERVER_BIN: ${{ runner.temp }}/llama.cpp/build/bin/llama-server
+          LLAMA_CPP_EXPECTED_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
+        run: timeout --signal=TERM --kill-after=15s 16m python3 scripts/run_local_model_once.py "$RUNNER_TEMP/qwen-coder.gguf" "$RUNNER_TEMP/candidate/daily-practice.raw.html" "$RUNNER_TEMP/ados-evidence/inference.json"
+
+      - name: Normalize generated output and preserve raw response
+        if: success()
+        run: |
+          set -euo pipefail
+          python3 scripts/normalize_generated_html.py \
+            "$RUNNER_TEMP/candidate/daily-practice.raw.html" \
+            "$RUNNER_TEMP/candidate/daily-practice.html"
+
+      - name: Validate generated page inside the isolated browser container
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --init --network none --read-only \
+            --user pwuser --cap-drop ALL --security-opt no-new-privileges \
+            --security-opt "seccomp=$GITHUB_WORKSPACE/tests/playwright-seccomp.json" \
+            --memory 1536m --cpus 2 --pids-limit 128 --shm-size 256m \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --tmpfs /home/pwuser/.cache:rw,nosuid,nodev,size=128m \
+            -e NODE_PATH=/playwright/node_modules \
+            -v "$RUNNER_TEMP/pw/node_modules:/playwright/node_modules:ro" \
+            -v "$GITHUB_WORKSPACE/scripts/check_local_generated_page.cjs:/test/check.cjs:ro" \
+            -v "$RUNNER_TEMP/candidate:/candidate:ro" \
+            --entrypoint node mcr.microsoft.com/playwright:v1.64.1-noble /test/check.cjs
+          printf '{"functional_validation":"PASS","candidate_commit":"none; feasibility only"}\n' \
+            > "$RUNNER_TEMP/ados-evidence/functional-validation.json"
+
+      - name: Upload bounded synthetic evidence without model weights or server logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: local-model-attempt-2-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ados-evidence/*.json
+            ${{ runner.temp }}/candidate/daily-practice.raw.html
+            ${{ runner.temp }}/candidate/daily-practice.html
+          if-no-files-found: ignore
+          retention-days: 90
+

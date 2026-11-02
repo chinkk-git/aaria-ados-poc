@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Daily Practice</title></head>
+<body><main><h1>Daily Practice</h1><button id="completeButton" type="button">Mark Complete</button><p id="completionStatus" role="status" aria-live="polite">Not completed</p></main>
+<script>
+const status = document.getElementById("completionStatus");
+if (localStorage.getItem("done") === "yes") status.textContent = "Completed";
+document.getElementById("completeButton").addEventListener("click", () => {
+  status.textContent = "Completed";
+  localStorage.setItem("done", "yes");
+});
+</script></body></html>

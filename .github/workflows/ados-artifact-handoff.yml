@@ -1,0 +1,443 @@
+name: ADOS-POC-002 artifact-only handoff
+run-name: ADOS-POC-002 artifact handoff
+
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed_pr_head:
+        description: Exact PR #17 head SHA accepted by independent technical review
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: read
+  actions: read
+  pull-requests: read
+
+concurrency:
+  group: ados-poc-002-exclusive-write-lease
+  cancel-in-progress: false
+
+jobs:
+  handoff:
+    if: >-
+      github.repository == 'chinkk-git/aaria-ados-poc' &&
+      github.actor == 'chinkk-git' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: write
+      issues: write
+      actions: read
+      pull-requests: read
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Reconcile authorization, claim and target state
+        id: recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          CLAIM_ID: ADOS-POC-002-ARTIFACT-HANDOFF-001
+          CLAIM_MARKER: '<!-- ADOS_CLAIM:ADOS-POC-002-ARTIFACT-HANDOFF-001 -->'
+          CONSUMED_MARKER: '<!-- ADOS_CONSUMED:ADOS-POC-002-ARTIFACT-HANDOFF-001 -->'
+          SOURCE_COMMIT_SHA: 0b3dde4c94f045544632fe39d3fdc4c06bd55686
+          AUTHORIZED_PR_HEAD: ${{ inputs.reviewed_pr_head }}
+          SOURCE_PATH: evidence/local-model-attempt-2-validated.html
+          SOURCE_SHA256: f6b3e7d235ad13a6862e7c579598cc0ad7a0408c0a84d5a441f0e74f59eaf250
+          TARGET_BRANCH: feature/ados-poc-002
+          EXPECTED_TARGET_SHA: 657e51007d9bb7cb95d9ca3931ec45da1c34c149
+          TARGET_PATH: daily-practice.html
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GH_REPOSITORY" = "chinkk-git/aaria-ados-poc"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_ACTOR" = "chinkk-git"
+
+          # The required manual-dispatch value binds the reviewed PR head without a
+          # self-referential commit pin; it must equal the live merged PR head.
+          pr_json="$(gh api "repos/$GH_REPOSITORY/pulls/17")"
+          pr_merged="$(jq -r '.merged' <<< "$pr_json")"
+          live_pr_head="$(jq -r '.head.sha' <<< "$pr_json")"
+          [[ "$AUTHORIZED_PR_HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "REJECTED: reviewed PR head input is not a full SHA"; exit 1; }
+          live_pr_author="$(jq -r '.user.login' <<< "$pr_json")"
+          live_pr_head_repo="$(jq -r '.head.repo.full_name // empty' <<< "$pr_json")"
+          live_pr_head_ref="$(jq -r '.head.ref' <<< "$pr_json")"
+          compare_json="$(gh api "repos/$GH_REPOSITORY/compare/$SOURCE_COMMIT_SHA...$live_pr_head")"
+
+          test "$(gh api "repos/$GH_REPOSITORY/issues/9" --jq .title)" = "[ADOS-POC-002] Daily Practice Complete"
+          test -s "$SOURCE_PATH"
+          cp -- "$SOURCE_PATH" "$RUNNER_TEMP/daily-practice.html"
+          source_digest="$(sha256sum "$RUNNER_TEMP/daily-practice.html" | cut -d' ' -f1)"
+          test "$source_digest" = "$SOURCE_SHA256" || {
+            echo "REJECTED: authorized source artifact digest mismatch"
+            exit 1
+          }
+
+          git fetch --no-tags origin "$TARGET_BRANCH" --quiet
+          target_head="$(git rev-parse FETCH_HEAD)"
+          target_file_exists=false
+          target_parent=""
+          target_parent_count=0
+          target_digest=""
+          target_mode=""
+          target_type=""
+          target_files='[]'
+          if git cat-file -e "$target_head:$TARGET_PATH" 2>/dev/null; then
+            target_file_exists=true
+            target_parent="$(git rev-parse "$target_head^")"
+            target_parent_count="$(git rev-list --parents -n 1 "$target_head" | awk '{print NF-1}')"
+            target_digest="$(git show "$target_head:$TARGET_PATH" | sha256sum | cut -d' ' -f1)"
+            tree_entry="$(git ls-tree "$target_head" -- "$TARGET_PATH")"
+            target_mode="$(awk '{print $1}' <<< "$tree_entry")"
+            target_type="$(awk '{print $2}' <<< "$tree_entry")"
+            target_files="$(git diff-tree --no-commit-id --name-only -r "$target_head" | jq -R . | jq -s .)"
+          fi
+
+          comments_json="$(gh api --paginate --slurp "repos/$GH_REPOSITORY/issues/9/comments?per_page=100")"
+          claim_count="$(jq --arg marker "$CLAIM_MARKER" '[.[][] | select((.body // "") | contains($marker))] | length' <<< "$comments_json")"
+          prior_run_json='{}'
+          if [[ "$claim_count" == "1" ]]; then
+            prior_run_id="$(jq -r --arg marker "$CLAIM_MARKER" '[.[][] | select((.body // "") | contains($marker))][0].body | capture("(?m)^Run: (?<id>[0-9]+)$").id' <<< "$comments_json")"
+            prior_run_json="$(gh api "repos/$GH_REPOSITORY/actions/runs/$prior_run_id")"
+          fi
+
+          jq -n \
+            --arg claim_id "$CLAIM_ID" \
+            --arg claim_marker "$CLAIM_MARKER" \
+            --arg consumed_marker "$CONSUMED_MARKER" \
+            --arg source_commit_sha "$SOURCE_COMMIT_SHA" \
+            --arg source_path "$SOURCE_PATH" \
+            --arg source_sha256 "$SOURCE_SHA256" \
+            --arg target_branch "$TARGET_BRANCH" \
+            --arg expected_target_sha "$EXPECTED_TARGET_SHA" \
+            --arg target_path "$TARGET_PATH" \
+            --arg target_head "$target_head" \
+            --arg target_parent "$target_parent" \
+            --arg target_digest "$target_digest" \
+            --arg target_mode "$target_mode" \
+            --arg target_type "$target_type" \
+            --argjson target_parent_count "$target_parent_count" \
+            --argjson target_file_exists "$target_file_exists" \
+            --argjson target_files "$target_files" \
+            --argjson comments "$comments_json" \
+            --argjson prior_run "$prior_run_json" \
+            --argjson pr_merged "$pr_merged" \
+            --arg live_pr_head "$live_pr_head" \
+            --arg authorized_pr_head "$AUTHORIZED_PR_HEAD" \
+            --arg live_pr_author "$live_pr_author" \
+            --arg live_pr_head_repo "$live_pr_head_repo" \
+            --arg live_pr_head_ref "$live_pr_head_ref" \
+            --argjson compare "$compare_json" \
+            '{claim_id:$claim_id, claim_marker:$claim_marker, consumed_marker:$consumed_marker, source_commit_sha:$source_commit_sha, source_path:$source_path, source_sha256:$source_sha256, target_branch:$target_branch, expected_target_sha:$expected_target_sha, target_path:$target_path, target_head:$target_head, target_parent:$target_parent, target_parent_count:$target_parent_count, target_digest:$target_digest, target_mode:$target_mode, target_type:$target_type, target_file_exists:$target_file_exists, target_files:$target_files, comments:[$comments[][]], prior_run:$prior_run, pr_merged:$pr_merged, live_pr_head:$live_pr_head, authorized_pr_head:$authorized_pr_head, live_pr_author:$live_pr_author, live_pr_head_repo:$live_pr_head_repo, live_pr_head_ref:$live_pr_head_ref, compare:$compare}' \
+            > "$RUNNER_TEMP/handoff-state.json"
+          decision_json="$(python3 - "$RUNNER_TEMP/handoff-state.json" <<'PY'
+          # ADOS_HANDOFF_POLICY_BEGIN
+          import json
+          import sys
+
+          BOT = "github-actions[bot]"
+          WORKFLOW_PATH = ".github/workflows/ados-artifact-handoff.yml"
+          LEASE = "ados-poc-002-exclusive-write-lease"
+
+          class PolicyError(RuntimeError):
+              pass
+
+          def verify_reviewed_source(source_sha, authorized_pr_head, pr_merged, live_pr_head, pr_author, head_repo, head_ref, comparison):
+              if pr_merged is not True:
+                  raise PolicyError("source_pr_not_merged")
+              if not isinstance(authorized_pr_head, str) or len(authorized_pr_head) != 40 or any(ch not in "0123456789abcdef" for ch in authorized_pr_head):
+                  raise PolicyError("authorized_pr_head_invalid")
+              if authorized_pr_head != live_pr_head:
+                  raise PolicyError("authorized_pr_head_mismatch")
+              if pr_author != "chinkk-git":
+                  raise PolicyError("source_pr_author_mismatch")
+              if head_repo != "chinkk-git/aaria-ados-poc" or head_ref != "experiment/python-multiprovider-executor":
+                  raise PolicyError("source_pr_head_mismatch")
+              if not live_pr_head or comparison.get("head_commit", {}).get("sha") != live_pr_head:
+                  raise PolicyError("live_pr_head_mismatch")
+              if comparison.get("base_commit", {}).get("sha") != source_sha:
+                  raise PolicyError("reviewed_source_base_mismatch")
+              if comparison.get("merge_base_commit", {}).get("sha") != source_sha:
+                  raise PolicyError("reviewed_source_not_in_live_pr_head")
+              if comparison.get("status") not in {"ahead", "identical"}:
+                  raise PolicyError("reviewed_source_comparison_invalid")
+
+          def _one_line(body, prefix):
+              values = [line[len(prefix):] for line in body.splitlines() if line.startswith(prefix)]
+              if len(values) != 1:
+                  raise PolicyError("claim_field_invalid:" + prefix)
+              return values[0]
+
+          def _comments(data):
+              comments = data.get("comments", [])
+              if not isinstance(comments, list) or any(not isinstance(comment, dict) for comment in comments):
+                  raise PolicyError("comments_shape_invalid")
+              return comments
+
+          def _require_claim(comment, data):
+              if comment.get("user", {}).get("login") != BOT:
+                  raise PolicyError("claim_owner_mismatch")
+              body = comment.get("body", "")
+              if body.count(data["claim_marker"]) != 1:
+                  raise PolicyError("claim_marker_invalid")
+              claim_ids = [line[len("Claim ID: "):] for line in body.splitlines() if line.startswith("Claim ID: ")]
+              if len(claim_ids) > 1 or (claim_ids and claim_ids[0] != data["claim_id"]):
+                  raise PolicyError("claim_id_mismatch")
+              run_id = _one_line(body, "Run: ")
+              if not run_id.isdigit():
+                  raise PolicyError("claim_run_id_invalid")
+              if _one_line(body, "Source: ") != f'{data["source_commit_sha"]} ({data["source_path"]})':
+                  raise PolicyError("claim_source_mismatch")
+              if _one_line(body, "Reviewed PR head: ") != data["authorized_pr_head"]:
+                  raise PolicyError("claim_reviewed_head_mismatch")
+              if _one_line(body, "Artifact SHA-256: ") != data["source_sha256"]:
+                  raise PolicyError("claim_digest_mismatch")
+              if _one_line(body, "Target: ") != f'{data["target_branch"]} at {data["expected_target_sha"]}':
+                  raise PolicyError("claim_target_mismatch")
+              if _one_line(body, "Write scope: ") != f'{data["target_path"]} only':
+                  raise PolicyError("claim_scope_mismatch")
+              if _one_line(body, "Lease: ") != LEASE:
+                  raise PolicyError("claim_lease_mismatch")
+              return run_id
+
+          def _require_completed_claim_run(run, run_id, allow_success):
+              if run.get("id") != int(run_id):
+                  raise PolicyError("claim_run_identity_mismatch")
+              if run.get("path") != WORKFLOW_PATH or run.get("event") != "workflow_dispatch":
+                  raise PolicyError("claim_run_provenance_mismatch")
+              if run.get("head_branch") != "main":
+                  raise PolicyError("claim_run_branch_mismatch")
+              if run.get("actor", {}).get("login") != "chinkk-git":
+                  raise PolicyError("claim_run_actor_mismatch")
+              if run.get("triggering_actor", {}).get("login") != "chinkk-git":
+                  raise PolicyError("claim_run_trigger_mismatch")
+              if run.get("status") != "completed":
+                  raise PolicyError("prior_claim_run_still_active")
+              accepted = {"failure", "cancelled", "timed_out"}
+              if allow_success:
+                  accepted.add("success")
+              if run.get("conclusion") not in accepted:
+                  raise PolicyError("prior_claim_run_state_ambiguous")
+
+          def _require_consumed(comment, data, run_id, target_head):
+              if comment.get("user", {}).get("login") != BOT:
+                  raise PolicyError("consumption_owner_mismatch")
+              body = comment.get("body", "")
+              is_current_record = body.count(data["consumed_marker"]) == 1
+              is_legacy_record = (
+                  "ADOS-POC-002 artifact handoff CONSUMED." in body.splitlines()
+                  and any(line.startswith(f'Claim: {data["claim_id"]}') for line in body.splitlines())
+              )
+              if not (is_current_record or is_legacy_record):
+                  raise PolicyError("consumption_marker_invalid")
+              run_lines = [
+                  line for line in body.splitlines()
+                  if line.startswith("Claim run: ") or line.startswith("Workflow run: ")
+              ]
+              if len(run_lines) != 1 or run_lines[0].split(": ", 1)[1] != run_id:
+                  raise PolicyError("consumption_run_mismatch")
+              expected = (
+                  f'Artifact SHA-256: {data["source_sha256"]}',
+                  f"Task branch commit: {target_head}",
+                  f'Only {data["target_path"]} was committed.',
+              )
+              if any(line not in body.splitlines() for line in expected):
+                  raise PolicyError("consumption_evidence_mismatch")
+
+          def decide(data):
+              verify_reviewed_source(
+                  data["source_commit_sha"], data["authorized_pr_head"], data["pr_merged"],
+                  data["live_pr_head"], data["live_pr_author"],
+                  data["live_pr_head_repo"], data["live_pr_head_ref"], data["compare"]
+              )
+              all_comments = _comments(data)
+              claims = [c for c in all_comments if data["claim_marker"] in (c.get("body") or "")]
+              consumed = [
+                  c for c in all_comments
+                  if data["consumed_marker"] in (c.get("body") or "")
+                  or (
+                      "ADOS-POC-002 artifact handoff CONSUMED." in (c.get("body") or "").splitlines()
+                      and any(line.startswith(f'Claim: {data["claim_id"]}') for line in (c.get("body") or "").splitlines())
+                  )
+              ]
+              if len(claims) > 1 or len(consumed) > 1:
+                  raise PolicyError("duplicate_claim_or_consumption")
+              target = data
+              unchanged = (
+                  target["target_head"] == target["expected_target_sha"]
+                  and target["target_file_exists"] is False
+              )
+              if not claims:
+                  if consumed or not unchanged:
+                      raise PolicyError("target_or_consumption_without_claim")
+                  return {"mode": "new_claim"}
+
+              claim = claims[0]
+              claim_run_id = _require_claim(claim, data)
+              _require_completed_claim_run(data["prior_run"], claim_run_id, allow_success=not unchanged)
+              if unchanged:
+                  if consumed:
+                      raise PolicyError("consumed_claim_target_unchanged")
+                  return {"mode": "resume_same_claim", "claim_comment_id": claim["id"], "claim_run_id": claim_run_id}
+
+              exact_committed_file = (
+                  target["target_file_exists"] is True
+                  and target["target_head"] != target["expected_target_sha"]
+                  and target["target_parent"] == target["expected_target_sha"]
+                  and target["target_parent_count"] == 1
+                  and target["target_files"] == [target["target_path"]]
+                  and target["target_digest"] == target["source_sha256"]
+                  and target["target_mode"] == "100644"
+                  and target["target_type"] == "blob"
+              )
+              if not exact_committed_file:
+                  raise PolicyError("target_state_conflict")
+              if consumed:
+                  _require_consumed(consumed[0], data, claim_run_id, target["target_head"])
+                  return {"mode": "already_finalized", "claim_comment_id": claim["id"], "claim_run_id": claim_run_id, "commit_sha": target["target_head"]}
+              return {"mode": "finalize_without_push", "claim_comment_id": claim["id"], "claim_run_id": claim_run_id, "commit_sha": target["target_head"]}
+
+          # ADOS_HANDOFF_POLICY_END
+          with open(sys.argv[1], encoding="utf-8") as f:
+              state = json.load(f)
+          try:
+              result = decide(state)
+          except (PolicyError, KeyError, TypeError, ValueError) as exc:
+              print("REJECTED: " + str(exc), file=sys.stderr)
+              raise SystemExit(1)
+          print(json.dumps(result, sort_keys=True))
+          PY
+          )"
+          mode="$(jq -r '.mode' <<< "$decision_json")"
+          case "$mode" in
+            new_claim)
+              claim_body="$(printf '%s\n' \
+                "$CLAIM_MARKER" \
+                "ADOS-POC-002 artifact handoff CLAIMED." \
+                "Claim ID: $CLAIM_ID" \
+                "Run: $GITHUB_RUN_ID" \
+                "Source: $SOURCE_COMMIT_SHA ($SOURCE_PATH)" \
+                "Reviewed PR head: $AUTHORIZED_PR_HEAD" \
+                "Artifact SHA-256: $SOURCE_SHA256" \
+                "Target: $TARGET_BRANCH at $EXPECTED_TARGET_SHA" \
+                "Write scope: $TARGET_PATH only" \
+                "Lease: ados-poc-002-exclusive-write-lease")"
+              claim_comment_id="$(gh api --method POST "repos/$GH_REPOSITORY/issues/9/comments" -f "body=$claim_body" --jq .id)"
+              test -n "$claim_comment_id"
+              echo "mode=write" >> "$GITHUB_OUTPUT"
+              echo "claim_comment_id=$claim_comment_id" >> "$GITHUB_OUTPUT"
+              echo "claim_run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+              ;;
+            resume_same_claim)
+              echo "mode=write" >> "$GITHUB_OUTPUT"
+              echo "claim_comment_id=$(jq -r '.claim_comment_id' <<< "$decision_json")" >> "$GITHUB_OUTPUT"
+              echo "claim_run_id=$(jq -r '.claim_run_id' <<< "$decision_json")" >> "$GITHUB_OUTPUT"
+              echo "RECOVERY: resuming the existing single-use claim"
+              ;;
+            finalize_without_push)
+              echo "mode=finalize_without_push" >> "$GITHUB_OUTPUT"
+              echo "claim_comment_id=$(jq -r '.claim_comment_id' <<< "$decision_json")" >> "$GITHUB_OUTPUT"
+              echo "claim_run_id=$(jq -r '.claim_run_id' <<< "$decision_json")" >> "$GITHUB_OUTPUT"
+              echo "commit_sha=$(jq -r '.commit_sha' <<< "$decision_json")" >> "$GITHUB_OUTPUT"
+              echo "RECOVERY: exact authorized commit already exists; no push will occur"
+              ;;
+            already_finalized)
+              echo "mode=already_finalized" >> "$GITHUB_OUTPUT"
+              echo "HANDOFF: exact commit and consumption record already verified; no write will occur"
+              ;;
+            *)
+              echo "REJECTED: unexpected handoff policy result"
+              exit 1
+              ;;
+          esac
+
+      - name: Commit the artifact under the authorized claim
+        id: commit
+        if: steps.recovery.outputs.mode == 'write'
+        env:
+          TARGET_BRANCH: feature/ados-poc-002
+          EXPECTED_TARGET_SHA: 657e51007d9bb7cb95d9ca3931ec45da1c34c149
+          SOURCE_SHA256: f6b3e7d235ad13a6862e7c579598cc0ad7a0408c0a84d5a441f0e74f59eaf250
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          git fetch --no-tags origin "$TARGET_BRANCH" --quiet
+          current_target="$(git rev-parse FETCH_HEAD)"
+          test "$current_target" = "$EXPECTED_TARGET_SHA" || {
+            echo "REJECTED: task branch moved after claim"
+            exit 1
+          }
+          if git cat-file -e "$EXPECTED_TARGET_SHA:daily-practice.html" 2>/dev/null; then
+            echo "REJECTED: expected unchanged target unexpectedly contains output"
+            exit 1
+          fi
+          git checkout --detach "$EXPECTED_TARGET_SHA"
+          install -m 0644 "$RUNNER_TEMP/daily-practice.html" daily-practice.html
+          test "$(sha256sum daily-practice.html | cut -d' ' -f1)" = "$SOURCE_SHA256"
+          git add -- daily-practice.html
+          test "$(git diff --cached --name-only)" = "daily-practice.html"
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "feat: complete ADOS POC 002 daily practice page"
+          commit_sha="$(git rev-parse HEAD)"
+          test "$(git rev-parse "$commit_sha^")" = "$EXPECTED_TARGET_SHA"
+          test "$(git diff-tree --no-commit-id --name-only -r "$commit_sha")" = "daily-practice.html"
+          git push --porcelain origin "$commit_sha:refs/heads/$TARGET_BRANCH"
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$commit_sha"
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "VERIFIED: one-file commit $commit_sha"
+
+      - name: Record completed handoff
+        if: >-
+          steps.recovery.outputs.mode == 'finalize_without_push' ||
+          (steps.recovery.outputs.mode == 'write' && success())
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          CLAIM_ID: ADOS-POC-002-ARTIFACT-HANDOFF-001
+          CLAIM_COMMENT_ID: ${{ steps.recovery.outputs.claim_comment_id }}
+          CLAIM_RUN_ID: ${{ steps.recovery.outputs.claim_run_id }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha || steps.recovery.outputs.commit_sha }}
+          SOURCE_COMMIT_SHA: 0b3dde4c94f045544632fe39d3fdc4c06bd55686
+          AUTHORIZED_PR_HEAD: ${{ inputs.reviewed_pr_head }}
+          TARGET_BRANCH: feature/ados-poc-002
+          SOURCE_SHA256: f6b3e7d235ad13a6862e7c579598cc0ad7a0408c0a84d5a441f0e74f59eaf250
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_target="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$current_target" = "$COMMIT_SHA" || {
+            echo "REJECTED: task branch moved before claim finalization"
+            exit 1
+          }
+          test -n "$CLAIM_COMMENT_ID"
+          test -n "$CLAIM_RUN_ID"
+          test -n "$COMMIT_SHA"
+          body="$(printf '%s\n' \
+            '<!-- ADOS_CONSUMED:ADOS-POC-002-ARTIFACT-HANDOFF-001 -->' \
+            "Claim: $CLAIM_ID" \
+            "Claim run: $CLAIM_RUN_ID" \
+            "Finalization run: $GITHUB_RUN_ID" \
+            "Source commit: $SOURCE_COMMIT_SHA" \
+            "Reviewed PR head: $AUTHORIZED_PR_HEAD" \
+            "Artifact SHA-256: $SOURCE_SHA256" \
+            "Task branch commit: $COMMIT_SHA" \
+            "Only daily-practice.html was committed." \
+            "Reusable isolated browser validation: run 41485393545 passed on the exact source artifact; no new inference was run." \
+            "The shared concurrency lease remains held through this workflow and is released when this run completes.")"
+          gh api --method POST "repos/$GH_REPOSITORY/issues/9/comments" -f "body=$body"
+          echo "HANDOFF_CLAIM_CONSUMED: $CLAIM_ID"
+
+      - name: Confirm already finalized handoff without a write
+        if: steps.recovery.outputs.mode == 'already_finalized'
+        run: |
+          echo "VERIFIED: prior exact one-file commit and consumption record; no push or duplicate comment"

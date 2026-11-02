@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/ados/task-manifest.schema.json",
+  "title": "ADOS execution task manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "branch", "scope_paths", "providers", "cost_ceiling_usd", "max_provider_attempts"],
+  "properties": {
+    "task_id": {"type": "string", "pattern": "^ADOS-POC-[0-9]{3}$"},
+    "branch": {"type": "string", "pattern": "^(feature|experiment)/[a-z0-9][a-z0-9._/-]*$"},
+    "scope_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "providers": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{1,31}$"}},
+    "cost_ceiling_usd": {"const": 0.0},
+    "max_provider_attempts": {"type": "integer", "minimum": 1, "maximum": 3}
+  }
+}

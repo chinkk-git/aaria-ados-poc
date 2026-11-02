@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Daily Practice</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <h1>Daily Practice</h1>
+    <p id="status" role="status" aria-live="polite">Not completed</p>
+    <button id="mark-complete">Mark Complete</button>
+
+    <script>
+        document.getElementById('mark-complete').addEventListener('click', function() {
+            document.getElementById('status').textContent = 'Completed';
+        });
+    </script>
+</body>
+</html>

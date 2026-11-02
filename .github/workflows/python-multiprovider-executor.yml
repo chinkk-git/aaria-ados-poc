@@ -7,6 +7,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/python-multiprovider-executor.yml'
+      - '.github/workflows/ados-artifact-handoff.yml'
       - 'scripts/**'
       - 'schemas/**'
       - 'tasks/**'
@@ -43,6 +44,8 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_local_resource_limit.py' -v
           python3 -m unittest discover -s tests -p 'test_source_provenance.py' -v
           python3 -m unittest discover -s tests -p 'test_local_model_guard.py' -v
+          python3 -m unittest discover -s tests -p 'test_artifact_handoff_workflow.py' -v
+          ruby -e 'require "yaml"; YAML.parse_file(".github/workflows/ados-artifact-handoff.yml")'
           python3 scripts/normalize_generated_html.py \
             evidence/local-model-attempt-2-raw-output.html \
             "$RUNNER_TEMP/daily-practice-cleaned.html"

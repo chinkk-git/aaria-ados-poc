@@ -1,0 +1,140 @@
+name: ADOS-POC-002 artifact-only handoff
+run-name: ADOS-POC-002 artifact handoff
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  actions: read
+
+concurrency:
+  group: ados-poc-002-exclusive-write-lease
+  cancel-in-progress: false
+
+jobs:
+  handoff:
+    if: >-
+      github.repository == 'chinkk-git/aaria-ados-poc' &&
+      github.actor == 'chinkk-git' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: write
+      issues: write
+      actions: read
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Verify pinned handoff and claim the task lease
+        id: claim
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          CLAIM_ID: ADOS-POC-002-ARTIFACT-HANDOFF-001
+          CLAIM_MARKER: '<!-- ADOS_CLAIM:ADOS-POC-002-ARTIFACT-HANDOFF-001 -->'
+          SOURCE_SHA: 0b3dde4c94f045544632fe39d3fdc4c06bd55686
+          SOURCE_PATH: evidence/local-model-attempt-2-validated.html
+          SOURCE_SHA256: f6b3e7d235ad13a6862e7c579598cc0ad7a0408c0a84d5a441f0e74f59eaf250
+          TARGET_BRANCH: feature/ados-poc-002
+          EXPECTED_TARGET_SHA: 657e51007d9bb7cb95d9ca3931ec45da1c34c149
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GH_REPOSITORY" = "chinkk-git/aaria-ados-poc"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_ACTOR" = "chinkk-git"
+
+          # The validated source commit must be present in main before this workflow can run.
+          git fetch --no-tags origin main --quiet
+          git merge-base --is-ancestor "$SOURCE_SHA" FETCH_HEAD
+          test "$(gh api "repos/$GH_REPOSITORY/commits/$SOURCE_SHA" --jq .sha)" = "$SOURCE_SHA"
+          test "$(gh api "repos/$GH_REPOSITORY/issues/9" --jq .title)" = "[ADOS-POC-002] Daily Practice Complete"
+
+          # Reconcile the exact destination head and ensure the output does not already exist.
+          git fetch --no-tags origin "$TARGET_BRANCH" --quiet
+          target_head="$(git rev-parse FETCH_HEAD)"
+          test "$target_head" = "$EXPECTED_TARGET_SHA"
+          if git cat-file -e "$EXPECTED_TARGET_SHA:daily-practice.html" 2>/dev/null; then
+            echo "REJECTED: target file already exists at expected head"
+            exit 1
+          fi
+
+          # Read the immutable source artifact and verify its approved digest before claiming.
+          gh api "repos/$GH_REPOSITORY/contents/$SOURCE_PATH" -f "ref=$SOURCE_SHA" --jq -r .content |
+            tr -d '\r\n' | base64 --decode > "$RUNNER_TEMP/daily-practice.html"
+          actual_digest="$(sha256sum "$RUNNER_TEMP/daily-practice.html" | cut -d' ' -f1)"
+          test "$actual_digest" = "$SOURCE_SHA256" || {
+            echo "REJECTED: source artifact digest mismatch"
+            exit 1
+          }
+
+          # Check the complete paginated issue-comment history for the exact machine claim marker.
+          comments="$(gh api --paginate --jq '.[].body'             "repos/$GH_REPOSITORY/issues/9/comments?per_page=100")"
+          if grep -Fq "$CLAIM_MARKER" <<< "$comments"; then
+            echo "REJECTED: single-use handoff claim already exists"
+            exit 1
+          fi
+
+          claim_body="$(printf '%s\n'             "$CLAIM_MARKER"             "ADOS-POC-002 artifact handoff CLAIMED."             "Run: $GITHUB_RUN_ID"             "Source: $SOURCE_SHA ($SOURCE_PATH)"             "Artifact SHA-256: $SOURCE_SHA256"             "Target: $TARGET_BRANCH at $EXPECTED_TARGET_SHA"             "Write scope: daily-practice.html only"             "Lease: ados-poc-002-exclusive-write-lease")"
+          claim_comment_id="$(gh api --method POST             "repos/$GH_REPOSITORY/issues/9/comments"             -f "body=$claim_body" --jq .id)"
+          test -n "$claim_comment_id"
+          echo "claim_comment_id=$claim_comment_id" >> "$GITHUB_OUTPUT"
+          echo "claim_id=$CLAIM_ID"
+          echo "lease acquired by workflow run $GITHUB_RUN_ID"
+
+      - name: Commit the validated artifact to the exact task branch
+        id: commit
+        env:
+          GH_REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: feature/ados-poc-002
+          EXPECTED_TARGET_SHA: 657e51007d9bb7cb95d9ca3931ec45da1c34c149
+          SOURCE_SHA256: f6b3e7d235ad13a6862e7c579598cc0ad7a0408c0a84d5a441f0e74f59eaf250
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          git checkout --detach "$EXPECTED_TARGET_SHA"
+          test ! -e daily-practice.html
+          install -m 0644 "$RUNNER_TEMP/daily-practice.html" daily-practice.html
+          test "$(sha256sum daily-practice.html | cut -d' ' -f1)" = "$SOURCE_SHA256"
+          git add -- daily-practice.html
+          test "$(git diff --cached --name-only)" = "daily-practice.html"
+          git -c user.name='github-actions[bot]'               -c user.email='41898282+github-actions[bot]@users.noreply.github.com'               commit -m "feat: complete ADOS POC 002 daily practice page"
+          commit_sha="$(git rev-parse HEAD)"
+          test "$(git rev-parse "$commit_sha^")" = "$EXPECTED_TARGET_SHA"
+          test "$(git diff-tree --no-commit-id --name-only -r "$commit_sha")" = "daily-practice.html"
+
+          # A normal non-force push is a compare-and-swap on the expected parent:
+          # a concurrent target-branch update makes this push non-fast-forward and rejected.
+          git push --porcelain origin "$commit_sha:refs/heads/$TARGET_BRANCH"
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$commit_sha"
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "VERIFIED: one-file commit $commit_sha"
+
+      - name: Record consumed claim and handoff evidence
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          CLAIM_ID: ADOS-POC-002-ARTIFACT-HANDOFF-001
+          CLAIM_COMMENT_ID: ${{ steps.claim.outputs.claim_comment_id }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          SOURCE_SHA: 0b3dde4c94f045544632fe39d3fdc4c06bd55686
+          SOURCE_SHA256: f6b3e7d235ad13a6862e7c579598cc0ad7a0408c0a84d5a441f0e74f59eaf250
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CLAIM_COMMENT_ID"
+          test -n "$COMMIT_SHA"
+          body="$(printf '%s\n'             "ADOS-POC-002 artifact handoff CONSUMED."             "Claim: $CLAIM_ID (claim comment $CLAIM_COMMENT_ID)"             "Workflow run: $GITHUB_RUN_ID"             "Source commit: $SOURCE_SHA"             "Artifact SHA-256: $SOURCE_SHA256"             "Task branch commit: $COMMIT_SHA"             "Only daily-practice.html was committed."             "Reusable isolated browser validation: run 41485393545 passed on the exact source artifact; no new inference was run."             "The shared concurrency lease remains held through this workflow and is released when this run completes.")"
+          gh api --method POST "repos/$GH_REPOSITORY/issues/9/comments" -f "body=$body"
+          echo "HANDOFF_CLAIM_CONSUMED: $CLAIM_ID"

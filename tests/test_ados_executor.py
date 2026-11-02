@@ -112,7 +112,10 @@ class DispatchValidationTests(unittest.TestCase):
             "task_prompt": "Synthetic fixture only. No external model call.",
             "acceptance_criteria": ["Fake worker observes the approved task."],
             "cost_ceiling_usd": 0.0,
-            "max_attempts": 1,
+            "provider": "openrouter",
+            "provider_model": "openrouter/free",
+            "max_provider_calls": 1,
+            "max_workflow_recoveries": 2,
             "enabled": True,
         }
         self.path = self.manifest_dir / f"{self.issue}.json"
@@ -190,7 +193,8 @@ class DispatchValidationTests(unittest.TestCase):
                              ("task_prompt", "  "),
                              ("acceptance_criteria", []),
                              ("cost_ceiling_usd", 0.01),
-                             ("max_attempts", 4)):
+                             ("provider_model", "paid/model"),
+                             ("max_provider_calls", 2), ("max_workflow_recoveries", 4)):
             with self.subTest(field=field):
                 payload = dict(self.payload)
                 payload[field] = value
@@ -224,6 +228,28 @@ class DispatchValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ae.DuplicateExecution, "dispatch_claim_consumed"):
             self.resolve(consumed_task_ids=["ADOS-POC-999"])
 
+    def test_reconciliation_drains_unclaimed_tasks_without_concurrency_eviction(self):
+        second = dict(self.payload, issue_number=998, task_id="ADOS-POC-998",
+                      branch="experiment/ados-e01-second")
+        third = dict(self.payload, issue_number=997, task_id="ADOS-POC-997",
+                     branch="experiment/ados-e01-third")
+        issues = [
+            {"number": 999, "created_at": "2026-01-03T00:00:00Z", "user": {"login": "chinkk-git"}},
+            {"number": 998, "created_at": "2026-01-02T00:00:00Z", "user": {"login": "chinkk-git"}},
+            {"number": 997, "created_at": "2026-01-01T00:00:00Z", "user": {"login": "chinkk-git"}},
+        ]
+        manifests = {999: self.payload, 998: second, 997: third}
+        first = ae.select_reconciliation_candidate(issues, manifests)
+        self.assertEqual(first["issue_number"], 997)
+        second_candidate = ae.select_reconciliation_candidate(
+            issues, manifests, claimed_issue_numbers=[997], leased_branches=["experiment/ados-e01-second"])
+        self.assertEqual(second_candidate["issue_number"], 999)
+        event_only = ae.select_reconciliation_candidate(issues, manifests,
+            event_issue_number=998, event_actor="chinkk-git")
+        self.assertEqual(event_only["issue_number"], 998)
+        self.assertIsNone(ae.select_reconciliation_candidate(issues, manifests,
+            claimed_issue_numbers=[997, 998, 999]))
+
     def test_same_synthetic_event_cannot_execute_twice(self):
         class FakeWorkerAdapter:
             calls = 0
@@ -240,6 +266,97 @@ class DispatchValidationTests(unittest.TestCase):
         with self.assertRaises(ae.DuplicateExecution):
             self.resolve(seen_event_keys=ledger["events"], consumed_task_ids=ledger["tasks"])
         self.assertEqual(worker.calls, 1)
+
+
+class RemediationPolicyTests(unittest.TestCase):
+    def test_checkpoint_recovery_requires_exact_parent_and_full_scoped_diff(self):
+        allowed = ["daily-practice.html"]
+        files = {"daily-practice.html": b"fixture"}
+        ae.validate_checkpoint_recovery(
+            parent_shas=["a" * 40], expected_base_sha="a" * 40,
+            changed_paths=["daily-practice.html"], artifact_paths=["daily-practice.html"],
+            committed_files=files, artifact_files=files, allowed_paths=allowed,
+        )
+        with self.assertRaisesRegex(ValueError, "checkpoint_parent_mismatch"):
+            ae.validate_checkpoint_recovery(
+                parent_shas=["a" * 40, "c" * 40], expected_base_sha="a" * 40,
+                changed_paths=["daily-practice.html"], artifact_paths=["daily-practice.html"],
+                committed_files=files, artifact_files=files, allowed_paths=allowed,
+            )
+        with self.assertRaises(ae.UnauthorizedPath):
+            ae.validate_checkpoint_recovery(
+                parent_shas=["a" * 40], expected_base_sha="a" * 40,
+                changed_paths=["daily-practice.html", "README.md"],
+                artifact_paths=["daily-practice.html", "README.md"],
+                committed_files={**files, "README.md": b"intrusion"},
+                artifact_files={**files, "README.md": b"intrusion"}, allowed_paths=allowed,
+            )
+
+    def test_recovery_distinguishes_pre_call_uncertain_call_and_artifact_only(self):
+        args = dict(max_provider_calls=1, max_recoveries=2, recovery_number=1)
+        self.assertEqual(ae.recovery_action(provider_started=False, artifact_available=False,
+                         provider_calls=0, **args), "EXECUTE_ONCE")
+        self.assertEqual(ae.recovery_action(provider_started=True, artifact_available=False,
+                         provider_calls=1, **args), "BLOCK")
+        self.assertEqual(ae.recovery_action(provider_started=True, artifact_available=True,
+                         provider_calls=1, **args), "ARTIFACT_ONLY")
+        self.assertEqual(ae.recovery_action(provider_started=False, artifact_available=False,
+                         provider_calls=0, **{**args, "recovery_number": 3}), "BLOCK")
+
+    def test_provider_record_requires_verified_zero_cost_and_available_quota(self):
+        good = {"provider": "fixture", "model": "free-fixture", "eligibility": "VERIFIED_ZERO_COST",
+                "quota_status": "AVAILABLE", "quota_remaining": 2,
+                "cost_authorized_usd": 0.0, "last_verified_epoch": 1000}
+        ae.validate_provider_record(good, provider="fixture", model="free-fixture", now_epoch=1100)
+        for key, value in (("eligibility", "BILLING_UNVERIFIED"),
+                           ("quota_status", "EXHAUSTED"), ("quota_remaining", 0)):
+            invalid = dict(good); invalid[key] = value
+            with self.subTest(key=key), self.assertRaises(ae.ExecutorError):
+                ae.validate_provider_record(invalid, provider="fixture", model="free-fixture", now_epoch=1100)
+        stale = dict(good); stale["last_verified_epoch"] = 1
+        with self.assertRaisesRegex(ae.ExecutorError, "provider_eligibility_stale"):
+            ae.validate_provider_record(stale, provider="fixture", model="free-fixture", now_epoch=5000)
+
+    def test_repository_provider_status_blocks_current_exhausted_or_unverified_routes(self):
+        status = json.loads((Path(__file__).resolve().parents[1] / "providers" / "status.json").read_text())
+        with self.assertRaises(ae.ExecutorError):
+            ae.validate_provider_record(status["openrouter"], provider="openrouter",
+                                        model="openrouter/free", now_epoch=2_000_000_000)
+        with self.assertRaises(ae.ExecutorError):
+            ae.validate_provider_record(status["local"], provider="local",
+                                        model=status["local"]["model"], now_epoch=2_000_000_000)
+
+    def test_durable_ledger_requires_bot_and_associated_main_workflow_run(self):
+        event = "b" * 64; run_id = "123"
+        marker = f"<!-- ADOS_DISPATCH_CLAIM task=ADOS-POC-999 event={event} run={run_id} -->"
+        comment = {"body": marker, "user_login": "github-actions[bot]"}
+        run = {"id": 123, "repository": "chinkk-git/aaria-ados-poc",
+               "workflow_path": ".github/workflows/ados-dispatch.yml", "event": "issues",
+               "head_branch": "main", "head_sha": "a" * 40}
+        ledger = ae.dispatch_ledger([comment], {run_id: run}, repository="chinkk-git/aaria-ados-poc",
+                                    expected_base_sha="a" * 40)
+        self.assertEqual(ledger[2][event], run_id)
+        consumed = {"body": f"<!-- ADOS_DISPATCH_CONSUMED task=ADOS-POC-999 event={event} run={run_id} -->",
+                    "user_login": "github-actions[bot]"}
+        with_claim_and_consumption = ae.dispatch_ledger([comment, consumed], {run_id: run},
+            repository="chinkk-git/aaria-ados-poc", expected_base_sha="a" * 40)
+        self.assertIn("ADOS-POC-999", with_claim_and_consumption[1])
+        forged = dict(comment); forged["user_login"] = "attacker"
+        with self.assertRaisesRegex(ValueError, "dispatch_ledger_marker_forged"):
+            ae.dispatch_ledger([forged], {run_id: run}, repository="chinkk-git/aaria-ados-poc",
+                               expected_base_sha="a" * 40)
+        bad_run = dict(run); bad_run["head_sha"] = "c" * 40
+        with self.assertRaisesRegex(ValueError, "dispatch_ledger_run_unverified"):
+            ae.dispatch_ledger([comment], {run_id: bad_run}, repository="chinkk-git/aaria-ados-poc",
+                               expected_base_sha="a" * 40)
+        malformed = dict(comment); malformed["body"] += " extra"
+        with self.assertRaisesRegex(ValueError, "dispatch_ledger_marker_malformed"):
+            ae.dispatch_ledger([malformed], {run_id: run}, repository="chinkk-git/aaria-ados-poc",
+                               expected_base_sha="a" * 40)
+        # Historical Issue #9 markers are outside this parser's namespace.
+        self.assertEqual(ae.dispatch_ledger([{"body": "ADOS_CLAIM historical", "user_login": "user"}],
+                         {}, repository="chinkk-git/aaria-ados-poc", expected_base_sha="a" * 40),
+                         (set(), set(), {}, set()))
 
 
 class OrchestrationTests(unittest.TestCase):

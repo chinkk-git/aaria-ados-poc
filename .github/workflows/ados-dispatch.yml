@@ -1,25 +1,127 @@
 name: ADOS manifest-driven task dispatch
-run-name: ADOS dispatch issue-${{ github.event.issue.number }}
+run-name: ADOS manifest dispatch
 
 on:
   issues:
     types: [opened]
+  schedule:
+    - cron: "*/5 * * * *"
 
 permissions: {}
 
 jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      issue_number: ${{ steps.select.outputs.issue_number }}
+      issue_author: ${{ steps.select.outputs.issue_author }}
+      created_at: ${{ steps.select.outputs.created_at }}
+      action: ${{ steps.select.outputs.action }}
+    steps:
+      - name: Check out trusted manifests from main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Select an opened or durably unclaimed authorized issue
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          EVENT_ACTOR: ${{ github.actor }}
+          EVENT_PATH: ${{ github.event_path }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYSELECT'
+          import glob, json, os, pathlib, re, subprocess, urllib.parse
+          repo = os.environ["REPOSITORY"]
+          status = json.loads(pathlib.Path("providers/status.json").read_text())["openrouter"]
+          try:
+              import datetime, time
+              status_age = time.time() - datetime.datetime.fromisoformat(status["last_verified_at"].replace("Z", "+00:00")).timestamp()
+          except Exception:
+              status_age = float("inf")
+          provider_ready = (status.get("model") == "openrouter/free"
+              and status.get("eligibility") == "VERIFIED_ZERO_COST"
+              and status.get("quota_status") == "AVAILABLE"
+              and status.get("cost_authorized_usd") == 0.0
+              and type(status.get("quota_remaining")) is int and status["quota_remaining"] > 0
+              and 0 <= status_age <= 3600)
+          if not provider_ready:
+              issues = []
+          elif os.environ["EVENT_NAME"] == "issues":
+              event = json.loads(pathlib.Path(os.environ["EVENT_PATH"]).read_text())
+              issues = [event["issue"]] if event.get("action") == "opened" else []
+          else:
+              pages = json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp",
+                  f"repos/{repo}/issues?state=open&per_page=100"]))
+              issues = [item for page in pages for item in page if "pull_request" not in item]
+          from scripts.ados_executor import select_reconciliation_candidate
+          manifests = {}
+          claimed = set()
+          leased = set()
+          for issue in issues:
+              number = int(issue["number"])
+              manifest_path = pathlib.Path("tasks/issues") / f"{number}.json"
+              if not manifest_path.is_file():
+                  continue
+              manifest = json.loads(manifest_path.read_text())
+              manifests[number] = manifest
+              comments = json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp",
+                  f"repos/{repo}/issues/{number}/comments"]))
+              bodies = [c.get("body", "") for page in comments for c in page]
+              own_claim = False
+              if os.environ["RUN_ATTEMPT"] != "1":
+                  for body in bodies:
+                      match = re.fullmatch(
+                          r"<!-- ADOS_DISPATCH_CLAIM task=(ADOS-POC-[0-9]{3}) event=[0-9a-f]{64} run=([0-9]+) -->",
+                          body)
+                      if match and match.group(1) == manifest.get("task_id") and match.group(2) == os.environ["RUN_ID"]:
+                          own_claim = True
+                          break
+              if any("<!-- ADOS_DISPATCH_" in body for body in bodies) and not own_claim:
+                  claimed.add(number)
+              ref = "heads/" + urllib.parse.quote(manifest.get("branch", ""), safe="")
+              probe = subprocess.run(["gh", "api", f"repos/{repo}/git/ref/{ref}"],
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              if probe.returncode == 0 and not own_claim:
+                  leased.add(manifest.get("branch", ""))
+          event_number = int(os.environ["ISSUE_NUMBER"]) if os.environ["EVENT_NAME"] == "issues" else None
+          selected = select_reconciliation_candidate(
+              issues, manifests, claimed_issue_numbers=claimed, leased_branches=leased,
+              event_issue_number=event_number,
+              event_actor=os.environ["EVENT_ACTOR"] if os.environ["EVENT_NAME"] == "issues" else None)
+          if selected is None:
+              chosen = {"issue_number": "", "issue_author": "", "created_at": "", "action": ""}
+          else:
+              chosen = {"issue_number": selected["issue_number"], "issue_author": selected["issue_author"],
+                        "created_at": selected["created_at"],
+                        "action": "opened" if os.environ["EVENT_NAME"] == "issues" else "reconcile"}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for key, value in chosen.items():
+                  output.write(f"{key}={value}\n")
+          PYSELECT
+
   authorize:
-    if: >-
-      github.event.repository.default_branch == 'main' &&
-      github.actor == github.event.issue.user.login
+    needs: candidate
+    if: needs.candidate.outputs.issue_number != ''
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
-      group: ados-dispatch-authorization
+      group: ados-dispatch-authorization-${{ needs.candidate.outputs.issue_number }}
       cancel-in-progress: false
     permissions:
-      contents: read
+      contents: write
       issues: write
+      actions: read
     outputs:
       task_id: ${{ steps.preflight.outputs.task_id }}
       branch: ${{ steps.preflight.outputs.branch }}
@@ -37,11 +139,11 @@ jobs:
         id: preflight
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
-          EVENT_ACTOR: ${{ github.actor }}
-          ISSUE_CREATED_AT: ${{ github.event.issue.created_at }}
-          EVENT_ACTION: ${{ github.event.action }}
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
+          ISSUE_AUTHOR: ${{ needs.candidate.outputs.issue_author }}
+          EVENT_ACTOR: ${{ needs.candidate.outputs.issue_author }}
+          ISSUE_CREATED_AT: ${{ needs.candidate.outputs.created_at }}
+          EVENT_ACTION: ${{ needs.candidate.outputs.action }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -52,13 +154,34 @@ jobs:
           git fetch --no-tags origin main
           base_sha="$(git rev-parse origin/main)"
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" \
-            | jq '[.[][] | .body]' > "$RUNNER_TEMP/ados-comments.json"
+            | jq '[.[][] | {body: .body, user_login: .user.login}]' > "$RUNNER_TEMP/ados-comments-raw.json"
+          python3 - "$RUNNER_TEMP/ados-comments-raw.json" "$RUNNER_TEMP/ados-ledger.json" <<'PYLEDGER'
+          import json, os, pathlib, re, subprocess, sys
+          raw = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          runs = {}
+          marker = re.compile(r"<!-- ADOS_DISPATCH_(?:CLAIM|CONSUMED|PROVIDER_STARTED) task=ADOS-POC-[0-9]{3} event=[0-9a-f]{64} run=([0-9]+) -->")
+          for comment in raw:
+              body = comment.get("body", "")
+              if "<!-- ADOS_DISPATCH_" in body:
+                  found = list(marker.finditer(body))
+                  if len(found) != 1 or body.strip() != found[0].group(0):
+                      raise SystemExit("REJECTED: malformed durable ledger marker")
+                  run_id = found[0].group(1)
+                  if run_id not in runs:
+                      payload = json.loads(subprocess.check_output([
+                          "gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}"
+                      ]))
+                      runs[run_id] = {"id": payload.get("id"), "repository": os.environ["GITHUB_REPOSITORY"],
+                                      "workflow_path": payload.get("path"), "event": payload.get("event"),
+                                      "head_branch": payload.get("head_branch"), "head_sha": payload.get("head_sha")}
+          pathlib.Path(sys.argv[2]).write_text(json.dumps({"comments": raw, "runs": runs}))
+          PYLEDGER
           python3 scripts/ados_executor.py validate-dispatch \
             --issue "$ISSUE_NUMBER" --actor "$EVENT_ACTOR" \
             --repository "$REPOSITORY" --base-sha "$base_sha" \
             --created-at "$ISSUE_CREATED_AT" --action "$EVENT_ACTION" \
             --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
-            --comments-json "$RUNNER_TEMP/ados-comments.json" > "$RUNNER_TEMP/ados-dispatch.json"
+            --comments-json "$RUNNER_TEMP/ados-ledger.json" > "$RUNNER_TEMP/ados-dispatch.json"
           python3 - "$RUNNER_TEMP/ados-dispatch.json" "$GITHUB_OUTPUT" <<'PY'
           import json, pathlib, sys
           data = json.loads(pathlib.Path(sys.argv[1]).read_text())
@@ -67,24 +190,46 @@ jobs:
                   value = str(data[key]).lower() if isinstance(data[key], bool) else str(data[key])
                   output.write(f"{key}={value}\n")
           PY
+      - name: Verify selected provider zero-cost eligibility and quota
+        if: steps.preflight.outputs.resume != 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PYPROVIDER'
+          import json, pathlib, time, datetime
+          record = json.loads(pathlib.Path("providers/status.json").read_text())["openrouter"]
+          try:
+              age = time.time() - datetime.datetime.fromisoformat(record["last_verified_at"].replace("Z", "+00:00")).timestamp()
+          except Exception:
+              raise SystemExit("BLOCKED: provider eligibility timestamp is unknown")
+          if (record.get("model") != "openrouter/free" or record.get("eligibility") != "VERIFIED_ZERO_COST"
+                  or record.get("quota_status") != "AVAILABLE" or record.get("cost_authorized_usd") != 0.0
+                  or type(record.get("quota_remaining")) is not int or record["quota_remaining"] <= 0
+                  or age < 0 or age > 3600):
+              raise SystemExit("BLOCKED: selected provider is ineligible or quota is unverified/exhausted")
+          PYPROVIDER
 
       - name: Persist single-use task claim
         if: steps.preflight.outputs.resume != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
           TASK_ID: ${{ steps.preflight.outputs.task_id }}
           EVENT_KEY: ${{ steps.preflight.outputs.event_key }}
           RUN_ID: ${{ github.run_id }}
+          BRANCH: ${{ steps.preflight.outputs.branch }}
+          EXPECTED_BASE_SHA: ${{ steps.preflight.outputs.expected_base_sha }}
         shell: bash
         run: |
           set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$EXPECTED_BASE_SHA" >/dev/null
           body="<!-- ADOS_DISPATCH_CLAIM task=$TASK_ID event=$EVENT_KEY run=$RUN_ID -->"
           gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" -f body="$body" >/dev/null
+          started="<!-- ADOS_DISPATCH_PROVIDER_STARTED task=$TASK_ID event=$EVENT_KEY run=$RUN_ID -->"
+          gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" -f body="$started" >/dev/null
           echo "CLAIMED: $TASK_ID for event $EVENT_KEY"
 
   execute:
-    needs: authorize
+    needs: [candidate, authorize]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
@@ -115,12 +260,25 @@ jobs:
         if: github.run_attempt == 1
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
           TASK_ID: ${{ needs.authorize.outputs.task_id }}
           EVENT_KEY: ${{ needs.authorize.outputs.event_key }}
         shell: bash
         run: |
           set -euo pipefail
+          python3 - <<'PYPROVIDER'
+          import json, pathlib, time, datetime
+          record = json.loads(pathlib.Path("providers/status.json").read_text())["openrouter"]
+          try:
+              age = time.time() - datetime.datetime.fromisoformat(record["last_verified_at"].replace("Z", "+00:00")).timestamp()
+          except Exception:
+              raise SystemExit("BLOCKED: provider eligibility timestamp is unknown")
+          if (record.get("model") != "openrouter/free" or record.get("eligibility") != "VERIFIED_ZERO_COST"
+                  or record.get("quota_status") != "AVAILABLE" or record.get("cost_authorized_usd") != 0.0
+                  or type(record.get("quota_remaining")) is not int or record["quota_remaining"] <= 0
+                  or age < 0 or age > 3600):
+              raise SystemExit("BLOCKED: selected provider is ineligible or quota is unverified/exhausted")
+          PYPROVIDER
           test -n "$OPENROUTER_API_KEY" || { echo "BLOCKED: worker credential unavailable"; exit 1; }
           python3 - <<'PY'
           import json, os, pathlib, subprocess
@@ -148,7 +306,7 @@ jobs:
               }
               subprocess.run([
                   "opencode", "run", "--standalone", "--auto", "--model",
-                  "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", prompt
+                  "openrouter/free", prompt
               ], check=True, timeout=900, env=worker_env)
           finally:
               pathlib.Path("opencode.json").unlink(missing_ok=True)
@@ -157,7 +315,7 @@ jobs:
       - name: Validate worker output and package only permitted files
         if: github.run_attempt == 1
         env:
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
         shell: bash
         run: |
           set -euo pipefail
@@ -194,7 +352,7 @@ jobs:
           retention-days: 1
 
   publish:
-    needs: [authorize, execute]
+    needs: [candidate, authorize, execute]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
@@ -204,6 +362,7 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+      actions: read
     steps:
       - name: Check out the exact authorized base without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -219,7 +378,7 @@ jobs:
       - name: Revalidate the claim, current base, branch lease, and output scope
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
           TASK_ID: ${{ needs.authorize.outputs.task_id }}
           BRANCH: ${{ needs.authorize.outputs.branch }}
           EXPECTED_BASE_SHA: ${{ needs.authorize.outputs.expected_base_sha }}
@@ -230,15 +389,40 @@ jobs:
           set -euo pipefail
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "$EXPECTED_BASE_SHA" || { echo "REJECTED: main advanced after authorization"; exit 1; }
-          comments="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" | jq -r '[.[][] | .body] | join("\n")')"
-          grep -Fq "<!-- ADOS_DISPATCH_CLAIM task=$TASK_ID event=$EVENT_KEY run=$RUN_ID -->" <<<"$comments" || { echo "REJECTED: durable claim is missing or belongs to another run"; exit 1; }
-          if grep -Fq "<!-- ADOS_DISPATCH_CONSUMED task=$TASK_ID " <<<"$comments"; then echo "REJECTED: task claim is already consumed"; exit 1; fi
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" \
+            | jq '[.[][] | {body: .body, user_login: .user.login}]' > "$RUNNER_TEMP/ados-comments.json"
+          python3 - <<'PYLEDGER'
+          import json, os, pathlib, re, subprocess
+          from scripts.ados_executor import dispatch_ledger
+          comments = json.loads(pathlib.Path(os.environ["RUNNER_TEMP"] + "/ados-comments.json").read_text())
+          runs = {}
+          marker = re.compile(r"<!-- ADOS_DISPATCH_(?:CLAIM|CONSUMED|PROVIDER_STARTED) task=ADOS-POC-[0-9]{3} event=[0-9a-f]{64} run=([0-9]+) -->")
+          for comment in comments:
+              body = comment.get("body", "")
+              if "<!-- ADOS_DISPATCH_" not in body:
+                  continue
+              found = list(marker.finditer(body))
+              if len(found) != 1 or body.strip() != found[0].group(0):
+                  raise SystemExit("REJECTED: malformed durable ledger marker")
+              run_id = found[0].group(1)
+              if run_id not in runs:
+                  payload = json.loads(subprocess.check_output(["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}"]))
+                  runs[run_id] = {"id": payload.get("id"), "repository": os.environ["GITHUB_REPOSITORY"],
+                                  "workflow_path": payload.get("path"), "event": payload.get("event"),
+                                  "head_branch": payload.get("head_branch"), "head_sha": payload.get("head_sha")}
+          events, consumed, claims, started = dispatch_ledger(comments, runs,
+              repository=os.environ["GITHUB_REPOSITORY"], expected_base_sha=os.environ["EXPECTED_BASE_SHA"])
+          if claims.get(os.environ["EVENT_KEY"]) != os.environ["RUN_ID"] or os.environ["EVENT_KEY"] not in started:
+              raise SystemExit("REJECTED: authenticated claim/provider-start marker is missing")
+          if os.environ["TASK_ID"] in consumed:
+              raise SystemExit("REJECTED: durable task claim is already consumed")
+          PYLEDGER
           remote_sha="$(git ls-remote --heads origin "$BRANCH" | cut -f1)"
           checkpointed=false
           if [[ -n "$remote_sha" && "$remote_sha" != "$EXPECTED_BASE_SHA" ]]; then
             git fetch --no-tags origin "$BRANCH"
             git switch -c "$BRANCH" FETCH_HEAD
-            git merge-base --is-ancestor "$EXPECTED_BASE_SHA" HEAD || { echo "REJECTED: branch checkpoint has a different base"; exit 1; }
+            test "$(git rev-parse HEAD^)" = "$EXPECTED_BASE_SHA" || { echo "REJECTED: checkpoint parent is not the expected base"; exit 1; }
             test "$(git rev-list --count "$EXPECTED_BASE_SHA..HEAD")" = "1" || { echo "REJECTED: branch contains an unexpected number of checkpoints"; exit 1; }
             git log -1 --format=%B | grep -Fq "ADOS_DISPATCH_EVENT=$EVENT_KEY" || { echo "REJECTED: branch checkpoint belongs to another dispatch"; exit 1; }
             checkpointed=true
@@ -252,6 +436,20 @@ jobs:
           manifest = json.loads(pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text())
           with zipfile.ZipFile("dispatch-output.zip") as archive:
               names = archive.namelist()
+              if os.environ.get("ADOS_CHECKPOINTED") == "true":
+                  parents = subprocess.check_output(["git", "show", "-s", "--format=%P", "HEAD"], text=True).strip().split()
+                  if parents != [os.environ["EXPECTED_BASE_SHA"]]:
+                      raise SystemExit("REJECTED: recovered checkpoint parent mismatch")
+                  raw_diff = subprocess.check_output(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD"])
+                  diff_paths = sorted(p for p in raw_diff.decode().split("\0") if p)
+                  artifact_paths = sorted(names)
+                  if not diff_paths or diff_paths != artifact_paths:
+                      raise SystemExit("REJECTED: recovered artifact paths differ from complete commit diff")
+                  tree = subprocess.check_output(["git", "ls-tree", "-r", "--format=%(mode) %(path)", "HEAD"], text=True)
+                  for row in tree.splitlines():
+                      mode, path = row.split(" ", 1)
+                      if path in diff_paths and mode not in {"100644", "100755"}:
+                          raise SystemExit("REJECTED: checkpoint contains a symlink or gitlink")
               if not names or len(names) != len(set(names)):
                   raise SystemExit("REJECTED: output archive is empty or has duplicate members")
               for name in names:

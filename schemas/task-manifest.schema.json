@@ -7,7 +7,7 @@
   "required": [
     "issue_number", "authorized_actors", "repository", "task_id", "branch",
     "expected_base_sha", "permitted_paths", "task_prompt", "acceptance_criteria",
-    "cost_ceiling_usd", "max_attempts", "enabled"
+    "cost_ceiling_usd", "provider", "provider_model", "max_provider_calls", "max_workflow_recoveries", "enabled"
   ],
   "properties": {
     "issue_number": {"type": "integer", "minimum": 1},
@@ -29,7 +29,10 @@
       "items": {"type": "string", "minLength": 1, "maxLength": 1000}
     },
     "cost_ceiling_usd": {"const": 0.0},
-    "max_attempts": {"type": "integer", "minimum": 1, "maximum": 3},
+    "provider": {"const": "openrouter"},
+    "provider_model": {"const": "openrouter/free"},
+    "max_provider_calls": {"const": 1},
+    "max_workflow_recoveries": {"type": "integer", "minimum": 0, "maximum": 3},
     "enabled": {"type": "boolean"}
   }
 }

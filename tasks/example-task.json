@@ -9,6 +9,9 @@
   "task_prompt": "Synthetic fixture only. No external model call, provider call, or repository write.",
   "acceptance_criteria": ["The fake worker receives this manifest once."],
   "cost_ceiling_usd": 0.0,
-  "max_attempts": 1,
+  "provider": "openrouter",
+  "provider_model": "openrouter/free",
+  "max_provider_calls": 1,
+  "max_workflow_recoveries": 2,
   "enabled": false
 }

@@ -208,14 +208,18 @@ class DispatchManifest:
     task_prompt: str
     acceptance_criteria: tuple[str, ...]
     cost_ceiling_usd: float
-    max_attempts: int
+    provider: str
+    provider_model: str
+    max_provider_calls: int
+    max_workflow_recoveries: int
     enabled: bool
 
 
 DISPATCH_FIELDS = {
     "issue_number", "authorized_actors", "repository", "task_id", "branch",
     "expected_base_sha", "permitted_paths", "task_prompt", "acceptance_criteria",
-    "cost_ceiling_usd", "max_attempts", "enabled",
+    "cost_ceiling_usd", "provider", "provider_model", "max_provider_calls",
+    "max_workflow_recoveries", "enabled",
 }
 
 
@@ -267,15 +271,22 @@ def parse_dispatch_manifest(payload: object) -> DispatchManifest:
     cost = payload["cost_ceiling_usd"]
     if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost != 0:
         raise ValueError("dispatch_cost_must_be_zero")
-    attempts = payload["max_attempts"]
-    if type(attempts) is not int or not 1 <= attempts <= 3:
-        raise ValueError("dispatch_attempt_limit_invalid")
+    if payload["provider"] != "openrouter" or payload["provider_model"] != "openrouter/free":
+        raise ValueError("dispatch_provider_route_unapproved")
+    provider_calls = payload["max_provider_calls"]
+    recoveries = payload["max_workflow_recoveries"]
+    if type(provider_calls) is not int or provider_calls != 1:
+        raise ValueError("dispatch_provider_call_limit_invalid")
+    if type(recoveries) is not int or not 0 <= recoveries <= 3:
+        raise ValueError("dispatch_recovery_limit_invalid")
     return DispatchManifest(
         issue_number=payload["issue_number"], authorized_actors=tuple(actors),
         repository=repository, task_id=task_id, branch=branch,
         expected_base_sha=expected_base_sha, permitted_paths=tuple(paths),
         task_prompt=prompt, acceptance_criteria=tuple(criteria),
-        cost_ceiling_usd=float(cost), max_attempts=attempts, enabled=True,
+        cost_ceiling_usd=float(cost), provider=payload["provider"],
+        provider_model=payload["provider_model"], max_provider_calls=provider_calls,
+        max_workflow_recoveries=recoveries, enabled=True,
     )
 
 
@@ -327,6 +338,49 @@ def load_trusted_dispatch_manifest(
     return manifest
 
 
+def select_reconciliation_candidate(
+    issues: Sequence[Mapping[str, object]],
+    manifests: Mapping[int, object],
+    *,
+    claimed_issue_numbers: Sequence[int] = (),
+    leased_branches: Sequence[str] = (),
+    event_issue_number: int | None = None,
+    event_actor: str | None = None,
+) -> Mapping[str, object] | None:
+    """Return the oldest open authorized task still awaiting its durable lease."""
+    claimed = set(claimed_issue_numbers)
+    leased = set(leased_branches)
+    candidates: list[tuple[str, int, Mapping[str, object], DispatchManifest]] = []
+    for issue in issues:
+        number = issue.get("number")
+        author_data = issue.get("user")
+        author = author_data.get("login") if isinstance(author_data, Mapping) else None
+        created_at = issue.get("created_at")
+        if type(number) is not int or not isinstance(author, str) or not isinstance(created_at, str):
+            continue
+        if "pull_request" in issue or (event_issue_number is not None and number != event_issue_number):
+            continue
+        if event_actor is not None and author != event_actor:
+            continue
+        if number in claimed:
+            continue
+        try:
+            manifest = parse_dispatch_manifest(manifests[number])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if manifest.issue_number != number or author not in manifest.authorized_actors:
+            continue
+        if manifest.branch in leased:
+            continue
+        candidates.append((created_at, number, issue, manifest))
+    if not candidates:
+        return None
+    _, number, issue, manifest = min(candidates, key=lambda item: (item[0], item[1]))
+    return {"issue_number": number, "issue_author": issue["user"]["login"],
+            "created_at": issue["created_at"], "task_id": manifest.task_id,
+            "branch": manifest.branch}
+
+
 def dispatch_event_key(repository: str, issue_number: int, action: str,
                        created_at: str, manifest_bytes: bytes) -> str:
     """Stable idempotency key for duplicate deliveries of one issue-open event."""
@@ -335,23 +389,106 @@ def dispatch_event_key(repository: str, issue_number: int, action: str,
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
-CLAIM_MARKER = re.compile(r"<!-- ADOS_DISPATCH_CLAIM task=(ADOS-POC-[0-9]{3}) event=([0-9a-f]{64}) run=([0-9]+) -->")
-CONSUMED_MARKER = re.compile(r"<!-- ADOS_DISPATCH_CONSUMED task=(ADOS-POC-[0-9]{3}) event=([0-9a-f]{64}) run=([0-9]+) -->")
+DISPATCH_MARKER = re.compile(
+    r"<!-- ADOS_DISPATCH_(CLAIM|CONSUMED|PROVIDER_STARTED) "
+    r"task=(ADOS-POC-[0-9]{3}) event=([0-9a-f]{64}) run=([0-9]+) -->"
+)
+DISPATCH_MARKER_PREFIX = "<!-- ADOS_DISPATCH_"
 
 
-def dispatch_ledger(comment_bodies: Sequence[str]) -> tuple[set[str], set[str], dict[str, str]]:
-    """Extract durable event and task consumption markers from issue comments."""
+def dispatch_ledger(
+    comments: Sequence[Mapping[str, object]],
+    workflow_runs: Mapping[str, Mapping[str, object]],
+    *, repository: str,
+    expected_base_sha: str,
+) -> tuple[set[str], set[str], dict[str, str], set[str]]:
+    """Accept markers only from bot comments tied to a verified dispatcher run."""
     events: set[str] = set()
     tasks: set[str] = set()
     claims: dict[str, str] = {}
-    for body in comment_bodies:
-        for match in CLAIM_MARKER.finditer(body):
-            events.add(match.group(2))
-            claims[match.group(2)] = match.group(3)
-        for match in CONSUMED_MARKER.finditer(body):
-            tasks.add(match.group(1))
-            events.add(match.group(2))
-    return events, tasks, claims
+    provider_started: set[str] = set()
+    for comment in comments:
+        if not isinstance(comment, Mapping):
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str) or DISPATCH_MARKER_PREFIX not in body:
+            continue
+        matches = list(DISPATCH_MARKER.finditer(body))
+        if len(matches) != 1 or body.strip() != matches[0].group(0):
+            raise ValueError("dispatch_ledger_marker_malformed")
+        if comment.get("user_login") != "github-actions[bot]":
+            raise ValueError("dispatch_ledger_marker_forged")
+        kind, task, event, run_id = matches[0].groups()
+        run = workflow_runs.get(run_id)
+        if not isinstance(run, Mapping):
+            raise ValueError("dispatch_ledger_run_missing")
+        if (run.get("repository") != repository
+                or run.get("workflow_path") != ".github/workflows/ados-dispatch.yml"
+                or run.get("event") not in {"issues", "schedule"}
+                or run.get("head_branch") != "main"
+                or run.get("head_sha") != expected_base_sha
+                or run.get("id") != int(run_id)):
+            raise ValueError("dispatch_ledger_run_unverified")
+        events.add(event)
+        if kind == "CLAIM":
+            if event in claims and claims[event] != run_id:
+                raise ValueError("dispatch_ledger_conflicting_claims")
+            claims[event] = run_id
+        elif kind == "CONSUMED":
+            tasks.add(task)
+        elif kind == "PROVIDER_STARTED":
+            provider_started.add(event)
+    return events, tasks, claims, provider_started
+
+
+def validate_checkpoint_recovery(
+    *, parent_shas: Sequence[str], expected_base_sha: str,
+    changed_paths: Sequence[str], artifact_paths: Sequence[str],
+    committed_files: Mapping[str, bytes], artifact_files: Mapping[str, bytes],
+    allowed_paths: Sequence[str],
+) -> None:
+    """Validate exact parent, complete file scope, and artifact/commit identity."""
+    if list(parent_shas) != [expected_base_sha]:
+        raise ValueError("checkpoint_parent_mismatch")
+    validate_changed_paths(changed_paths, allowed_paths)
+    normalized_diff = sorted(normalize_scope_path(p) for p in changed_paths)
+    normalized_artifact = sorted(normalize_scope_path(p) for p in artifact_paths)
+    if normalized_diff != normalized_artifact:
+        raise UnauthorizedPath("checkpoint_artifact_diff_mismatch")
+    if set(committed_files) != set(normalized_diff) or set(artifact_files) != set(normalized_diff):
+        raise UnauthorizedPath("checkpoint_file_set_mismatch")
+    if any(committed_files[path] != artifact_files[path] for path in normalized_diff):
+        raise ValueError("checkpoint_artifact_content_mismatch")
+
+
+def recovery_action(*, provider_started: bool, artifact_available: bool,
+                    provider_calls: int, max_provider_calls: int,
+                    recovery_number: int, max_recoveries: int) -> str:
+    """Decide recovery without replaying a possibly consumed provider call."""
+    if recovery_number > max_recoveries:
+        return "BLOCK"
+    if artifact_available:
+        return "ARTIFACT_ONLY"
+    if provider_started or provider_calls >= max_provider_calls:
+        return "BLOCK"
+    return "EXECUTE_ONCE"
+
+
+def validate_provider_record(record: Mapping[str, object], *, provider: str,
+                             model: str, now_epoch: float,
+                             max_age_seconds: int = 3600) -> None:
+    """Fail closed unless trusted status proves current zero-cost quota eligibility."""
+    if (record.get("provider") != provider or record.get("model") != model
+            or record.get("eligibility") != "VERIFIED_ZERO_COST"
+            or record.get("quota_status") != "AVAILABLE"
+            or record.get("cost_authorized_usd") != 0.0):
+        raise ExecutorError("provider_eligibility_unverified")
+    remaining = record.get("quota_remaining")
+    if type(remaining) is not int or remaining <= 0:
+        raise ExecutorError("provider_quota_unavailable")
+    verified = record.get("last_verified_epoch")
+    if type(verified) not in (int, float) or now_epoch - verified > max_age_seconds:
+        raise ExecutorError("provider_eligibility_stale")
 
 
 @dataclass(frozen=True)
@@ -924,15 +1061,17 @@ def validate_dispatch_cli(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run-attempt", required=True, type=int)
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
     args = parser.parse_args(argv)
-    comments = json.loads(args.comments_json.read_text(encoding="utf-8"))
-    if not isinstance(comments, list) or any(not isinstance(item, str) for item in comments):
-        raise ValueError("dispatch_comments_invalid")
+    ledger_payload = json.loads(args.comments_json.read_text(encoding="utf-8"))
+    if not isinstance(ledger_payload, dict) or not isinstance(ledger_payload.get("comments"), list) or not isinstance(ledger_payload.get("runs"), dict):
+        raise ValueError("dispatch_ledger_input_invalid")
     manifest_path = args.repository_root / "tasks" / "issues" / f"{args.issue}.json"
     manifest_bytes = manifest_path.read_bytes()
     event_key = dispatch_event_key(
         args.repository, args.issue, args.action, args.created_at, manifest_bytes
     )
-    seen_events, consumed_tasks, claims = dispatch_ledger(comments)
+    seen_events, consumed_tasks, claims, provider_started = dispatch_ledger(
+        ledger_payload["comments"], ledger_payload["runs"], repository=args.repository,
+        expected_base_sha=args.base_sha)
     claim_run = claims.get(event_key)
     resumable_events: set[str] = set()
     if claim_run is not None and claim_run == args.run_id and args.run_attempt > 1:
@@ -943,8 +1082,8 @@ def validate_dispatch_cli(argv: Sequence[str] | None = None) -> int:
         seen_event_keys=seen_events, consumed_task_ids=consumed_tasks,
         resumable_event_keys=resumable_events,
     )
-    if args.run_attempt > manifest.max_attempts:
-        raise DuplicateExecution("dispatch_attempt_limit_exceeded")
+    if args.run_attempt - 1 > manifest.max_workflow_recoveries:
+        raise DuplicateExecution("dispatch_recovery_limit_exceeded")
     if claim_run is not None and (claim_run != args.run_id or event_key not in resumable_events):
         raise DuplicateExecution("dispatch_claim_owned_by_another_run")
     print(json.dumps({
@@ -955,9 +1094,13 @@ def validate_dispatch_cli(argv: Sequence[str] | None = None) -> int:
         "permitted_paths": list(manifest.permitted_paths),
         "task_prompt": manifest.task_prompt,
         "acceptance_criteria": list(manifest.acceptance_criteria),
-        "max_attempts": manifest.max_attempts,
+        "provider": manifest.provider,
+        "provider_model": manifest.provider_model,
+        "max_provider_calls": manifest.max_provider_calls,
+        "max_workflow_recoveries": manifest.max_workflow_recoveries,
         "event_key": event_key,
         "resume": event_key in resumable_events,
+        "provider_started": event_key in provider_started,
     }, separators=(",", ":")))
     return 0
 

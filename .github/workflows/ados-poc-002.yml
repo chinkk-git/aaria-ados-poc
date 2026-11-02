@@ -42,6 +42,7 @@ jobs:
     permissions:
       contents: write
       issues: write
+      pull-requests: write
       actions: read
     steps:
       - name: Checkout exclusive task branch
@@ -148,4 +149,12 @@ jobs:
           git commit -m "feat: implement ADOS POC 002 practice indicator"
           gh auth setup-git
           git push origin HEAD:feature/ados-poc-002
-          echo "VERIFIED: implementation pushed; PR handoff via authorized connector"
+          existing_prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-poc-002" --state all --json number --jq 'length')"
+          test "$existing_prs" = "0" || { echo "REJECTED: PR appeared before handoff; will not create a duplicate"; exit 1; }
+          commit_sha="$(git rev-parse HEAD)"
+          gh pr create --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head feature/ados-poc-002 \
+            --title "[ADOS-POC-002] Daily Practice Complete" \
+            --body "Implements Issue #9 acceptance criteria. Verified task commit: $commit_sha. The functional output gate passed before commit."
+          echo "VERIFIED: implementation pushed and exactly one task PR created from $commit_sha"

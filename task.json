@@ -4,7 +4,16 @@
   "state": "DEFINED",
   "branch": "feature/ados-control-plane-poc",
   "accountableWorker": "ados-builder",
-  "writeScope": ["index.html", "src/**", "test/**", "package.json", "task.json", "task.schema.json", ".github/workflows/**", "README.md"],
+  "writeScope": [
+    "index.html",
+    "src/**",
+    "test/**",
+    "package.json",
+    "task.json",
+    "task.schema.json",
+    ".github/workflows/**",
+    "README.md"
+  ],
   "maxRetries": 2,
   "acceptanceCriteria": [
     "Render a visible 15-minute countdown.",
@@ -15,7 +24,7 @@
   "experiments": {
     "E01": "BLOCKED",
     "E02": "PASS",
-    "E03": "FAIL",
+    "E03": "PASS",
     "E04": "PASS"
   }
 }

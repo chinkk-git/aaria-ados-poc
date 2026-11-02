@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Classify ADOS tasks and workflow evidence
+      - name: Reconcile exact task identity and durable checkpoints
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -27,9 +27,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, urllib.request, urllib.error, datetime, sys
-          repo = os.environ['GH_REPO']
-          token = os.environ['GH_TOKEN']
+          import json, os, urllib.request, urllib.error, datetime, pathlib, sys
+          repo, token = os.environ['GH_REPO'], os.environ['GH_TOKEN']
           now = datetime.datetime.now(datetime.timezone.utc)
           def get(path):
               req = urllib.request.Request('https://api.github.com/repos/'+repo+path,
@@ -38,31 +37,57 @@ jobs:
                   return json.load(resp)
           try:
               issues = get('/issues?state=open&per_page=100')
-              runs = get('/actions/runs?per_page=100').get('workflow_runs',[])
+              runs = get('/actions/workflows/ados-poc-002.yml/runs?per_page=100').get('workflow_runs',[])
               prs = get('/pulls?state=all&per_page=100')
-          except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError) as e:
-              print('BLOCKED: GitHub evidence retrieval failed:',type(e).__name__)
+              branches = {b: get('/branches/'+b.replace('/','%2F')) for b in ('feature/ados-poc-002',)}
+          except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+              print('BLOCKED: cannot retrieve required evidence:',type(e).__name__)
               sys.exit(1)
-          tasks = [i for i in issues if 'pull_request' not in i and i.get('title','').startswith('[ADOS-POC-')]
-          print('SUPERVISOR: read-only; '+now.isoformat()+'; tasks='+str(len(tasks)))
-          for issue in tasks:
-              task = issue['title'].split(']')[0][1:]
-              # Match issue event directly: no guessed workflow run identity.
-              matching = [r for r in runs if r.get('event')=='issues' and r.get('created_at','')>=issue['created_at']]
-              matching.sort(key=lambda r:r.get('created_at',''),reverse=True)
-              branch = 'feature/ados-poc-002' if task=='ADOS-POC-002' else ('feature/ados-control-plane-poc' if task=='ADOS-POC-001' else None)
-              linked = [p for p in prs if branch and p.get('head',{}).get('ref')==branch]
-              age = (now-datetime.datetime.fromisoformat(issue['created_at'].replace('Z','+00:00'))).total_seconds()/60
-              if linked:
-                  status='HANDOFF_PRESENT'
-              elif matching and any(r.get('status') in ('queued','in_progress','waiting','requested','pending') for r in matching):
-                  status='RUNNING_OR_QUEUED'
-              elif matching and age>=20:
-                  status='NEEDS_REVIEW'
-              elif age>=20:
-                  status='STALLED_NO_HANDOFF'
+          records=[]
+          for issue in issues:
+              if 'pull_request' in issue or issue.get('title') != '[ADOS-POC-002] Daily Practice Complete':
+                  continue
+              issue_id=issue['number']
+              identity='ADOS-POC-002 issue-'+str(issue_id)
+              exact=[r for r in runs if r.get('event')=='issues' and r.get('display_title')==identity]
+              linked=[p for p in prs if p.get('head',{}).get('ref')=='feature/ados-poc-002']
+              age=(now-datetime.datetime.fromisoformat(issue['created_at'].replace('Z','+00:00'))).total_seconds()/60
+              if len(exact)>1:
+                  status='AMBIGUOUS_DUPLICATE_RUNS'
+              elif len(exact)==1:
+                  run=exact[0]
+                  if run.get('status')!='completed':
+                      status='RUNNING_OR_QUEUED' if age<20 else 'STALLED_RUNNING'
+                  elif run.get('conclusion')=='success':
+                      status='HANDOFF_PRESENT' if linked else 'CHECK_COMMIT_AND_PREPARE_PR'
+                  else:
+                      status='BLOCKED_FAILED_RUN'
+              elif linked:
+                  status='LEGACY_UNCORRELATED_PR_PRESENT'
               else:
-                  status='AWAITING_EVIDENCE'
-              print(json.dumps({'task':task,'issue':issue['number'],'status':status,'age_minutes':round(age,1),'branch':branch,'matching_issue_event_runs':len(matching),'linked_prs':[p['number'] for p in linked],'latest_candidate_run':matching[0]['id'] if matching else None},sort_keys=True))
-          print('SUPERVISOR: no retries, dispatches, merges, secret reads, or repository writes')
+                  status='UNVERIFIED_DISPATCH' if age<20 else 'BLOCKED_MISSING_CORRELATED_RUN'
+              record={'task':'ADOS-POC-002','issue':issue_id,'run_id':exact[0]['id'] if len(exact)==1 else None,
+                'run_conclusion':exact[0].get('conclusion') if len(exact)==1 else None,
+                'run_head_sha':exact[0].get('head_sha') if len(exact)==1 else None,
+                'branch_head_sha':branches['feature/ados-poc-002']['commit']['sha'],
+                'linked_prs':[p['number'] for p in linked],
+                'status':status,'observed_at':now.isoformat(),
+                'next_action':'REVIEW_EVIDENCE_ONLY; no automatic retries or writes'}
+              records.append(record)
+              print(json.dumps(record,sort_keys=True))
+          if not records:
+              print('SUPERVISOR: no matching open ADOS-POC-002 task')
+          output=pathlib.Path('ados-supervisor-checkpoint.json')
+          output.write_text(json.dumps({'observed_at':now.isoformat(),'records':records},indent=2)+'\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary:
+              summary.write('## ADOS read-only supervisor\n\n')
+              for r in records:
+                  summary.write('- Issue #'+str(r['issue'])+': **'+r['status']+'**; run='+str(r['run_id'])+'; branch='+r['branch_head_sha']+'\n')
+              summary.write('\nNo automated retries, PR creation, merges or writes.\n')
           PY
+      - name: Save immutable monitoring evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ados-supervisor-checkpoint-${{ github.run_id }}
+          path: ados-supervisor-checkpoint.json
+          retention-days: 30

@@ -13,7 +13,7 @@ assert.ok(script, "timer script is present");
 function loadTimer() {
   const timer = { textContent: "" };
   const buttons = Object.fromEntries(
-    ["start", "pause", "reset"].map((id) => [id, { listener: null }]),
+    ["start", "pause", "reset"].map((id) => [id, {\n      listener: null,\n      addEventListener(event, listener) {\n        assert.equal(event, "click");\n        this.listener = listener;\n      },\n    }]),
   );
   const intervals = new Map();
   let nextInterval = 1;

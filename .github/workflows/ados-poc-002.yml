@@ -66,6 +66,37 @@ jobs:
           fi
           echo "VERIFIED: exclusive branch ready; manual resume allowance is unused"
 
+      - name: Inspect OpenRouter free daily allowance
+        id: openrouter_quota
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+            echo "state=UNAVAILABLE" >> "$GITHUB_OUTPUT"
+            echo "OpenRouter free allowance: unavailable (secret not configured)"
+            exit 0
+          fi
+          response="$(curl --silent --show-error --max-time 15 \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+            https://openrouter.ai/api/v1/key || true)"
+          remaining="$(printf '%s' "$response" | jq -er '.data.free_model_daily_requests.remaining | select(type == "number")' 2>/dev/null || true)"
+          unset response
+          if [[ "$remaining" =~ ^[0-9]+$ ]]; then
+            echo "remaining=$remaining" >> "$GITHUB_OUTPUT"
+            if (( remaining > 0 )); then
+              echo "state=AVAILABLE" >> "$GITHUB_OUTPUT"
+              echo "OpenRouter free allowance: available; remaining=$remaining"
+            else
+              echo "state=EXHAUSTED" >> "$GITHUB_OUTPUT"
+              echo "OpenRouter free allowance: exhausted; remaining=0"
+            fi
+          else
+            echo "state=UNKNOWN" >> "$GITHUB_OUTPUT"
+            echo "OpenRouter free allowance: unknown; provider will be skipped"
+          fi
+
       - name: Install pinned executor
         run: |
           set -euo pipefail
@@ -96,17 +127,64 @@ jobs:
           }
           JSON
 
-      - name: Run OpenCode on the Gemini free tier
+      - name: Run one free provider at a time with bounded failover
         env:
           GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_QUOTA_STATE: ${{ steps.openrouter_quota.outputs.state }}
         shell: bash
         run: |
           set -euo pipefail
-          trap 'rm -f opencode.json' EXIT
-          test -n "$GOOGLE_GENERATIVE_AI_API_KEY" || { echo "BLOCKED: missing GEMINI_API_KEY secret"; exit 1; }
-          opencode run --standalone --auto \
-            --model google/gemini-2.5-flash-lite \
-            "ADOS-POC-002. Create ONLY daily-practice.html: a self-contained accessible HTML page with a heading Daily Practice, a button Mark Complete, and a status indicator initially Not completed. Clicking the button changes status to Completed. Reload resets status to Not completed (no localStorage). Use no external dependencies, personal data, network calls, or other files. Do not edit index.html. Do not retry on provider errors or select a paid model."
+          trap 'rm -f opencode.json /tmp/ados-worker-output.log' EXIT
+          prompt="ADOS-POC-002. Create ONLY daily-practice.html: a self-contained accessible HTML page with a heading Daily Practice, a button Mark Complete, and a status indicator initially Not completed. Clicking the button changes status to Completed. Reload resets status to Not completed (no localStorage). Use no external dependencies, personal data, network calls, or other files. Do not edit index.html."
+
+          attempt() {
+            local provider="$1"
+            local model="$2"
+            local rc=0
+            if [[ "$provider" == "openrouter" ]]; then
+              env OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+                opencode run --standalone --auto --model "$model" "$prompt" > /tmp/ados-worker-output.log 2>&1 || rc=$?
+            else
+              env GOOGLE_GENERATIVE_AI_API_KEY="$GOOGLE_GENERATIVE_AI_API_KEY" \
+                opencode run --standalone --auto --model "$model" "$prompt" > /tmp/ados-worker-output.log 2>&1 || rc=$?
+            fi
+            if (( rc == 0 )); then
+              echo "VERIFIED: executor completed using provider=$provider"
+              return 0
+            fi
+            if grep -Eiq '429|401|403|RESOURCE_EXHAUSTED|free-models-per-day|rate.?limit|quota|503|UNAVAILABLE|ECONNRESET|ETIMEDOUT|service unavailable' /tmp/ados-worker-output.log; then
+              echo "PROVIDER_UNAVAILABLE: provider=$provider; classified as capacity, authentication, or service failure"
+              rm -f daily-practice.html
+              return 75
+            fi
+            echo "WORKER_FAILED: provider=$provider; non-provider failure; no failover retry"
+            return "$rc"
+          }
+
+          succeeded=false
+          if [[ "$OPENROUTER_QUOTA_STATE" == "AVAILABLE" && -n "${OPENROUTER_API_KEY:-}" ]]; then
+            if attempt openrouter openrouter/free; then
+              succeeded=true
+            else
+              rc=$?
+              (( rc == 75 )) || exit "$rc"
+            fi
+          else
+            echo "SKIPPED: OpenRouter quota state is $OPENROUTER_QUOTA_STATE"
+          fi
+
+          if [[ "$succeeded" != true ]]; then
+            test -n "${GOOGLE_GENERATIVE_AI_API_KEY:-}" || { echo "BLOCKED: Gemini key missing and no available OpenRouter free quota"; exit 1; }
+            if attempt gemini google/gemini-2.5-flash-lite; then
+              succeeded=true
+            else
+              rc=$?
+              (( rc == 75 )) && { echo "BLOCKED_QUOTA: both eligible free providers unavailable"; exit 1; }
+              exit "$rc"
+            fi
+          fi
+          test "$succeeded" = true
 
       - name: Enforce single-file output
         shell: bash

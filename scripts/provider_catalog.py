@@ -211,6 +211,19 @@ def default_status_records() -> dict[str, ProviderStatusRecord]:
     return {row.provider: row for row in rows}
 
 
+def verified_free_model_map(records: dict[str, ProviderStatusRecord]) -> dict[str, str]:
+    """Return only exact models whose recorded evidence allows zero-cost use."""
+    return {
+        name: row.model
+        for name, row in records.items()
+        if row.eligibility is EligibilityState.VERIFIED_FREE
+        and row.cost_authorized_usd == 0.0
+        and row.quota_status in {"AVAILABLE", "NOT_APPLICABLE"}
+        and row.last_verified_at is not None
+        and row.capabilities.coding
+    }
+
+
 def write_status_file(path, records: dict[str, ProviderStatusRecord]) -> None:
     payload = {name: record.as_json() for name, record in sorted(records.items())}
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

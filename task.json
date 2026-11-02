@@ -14,8 +14,8 @@
   ],
   "experiments": {
     "E01": "BLOCKED",
-    "E02": "NOT_RUN",
-    "E03": "NOT_RUN",
-    "E04": "NOT_RUN"
+    "E02": "PASS",
+    "E03": "FAIL",
+    "E04": "PASS"
   }
 }

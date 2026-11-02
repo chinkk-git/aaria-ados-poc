@@ -14,6 +14,7 @@ class LocalModelGuardPolicyTests(unittest.TestCase):
         self.assertIn('if ($jobs | length) == 0 then true', workflow)
         self.assertIn('($jobs | length) != 1 then false', workflow)
         self.assertIn('$jobs[0].conclusion == "skipped"', workflow)
+        self.assertIn('select(.name == "local-model-one-shot")', workflow)
 
     def test_guard_has_no_arbitrary_prior_run_count_cutoff(self):
         root = Path(__file__).resolve().parents[1]

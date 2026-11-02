@@ -13,8 +13,10 @@ const fail = (message) => { throw new Error(message); };
 export function validateManifest(manifest) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) fail("manifest must be an object");
   for (const key of requiredStrings) if (typeof manifest[key] !== "string" || !manifest[key].trim()) fail(key+" is required");
-  if (!/^ADOS-POC-\\d{3}$/.test(manifest.id)) fail("invalid task id");
-  if (!/^feature\\/[a-zA-Z0-9._/-]+$/.test(manifest.branch) || manifest.branch.includes("..")) fail("invalid branch");
+  const taskSuffix = manifest.id.startsWith("ADOS-POC-") ? manifest.id.slice(9) : "";
+  if (taskSuffix.length !== 3 || [...taskSuffix].some((c)=>c<"0"||c>"9")) fail("invalid task id");
+  const branchSuffix = manifest.branch.startsWith("feature/") ? manifest.branch.slice(8) : "";
+  if (!branchSuffix || branchSuffix.includes("..") || !new RegExp("^[a-zA-Z0-9._/-]+$").test(branchSuffix)) fail("invalid branch");
   if (!Array.isArray(manifest.writeScope) || !manifest.writeScope.length || manifest.writeScope.some((x)=>typeof x!=="string"||!x.trim())) fail("writeScope must contain paths");
   if (!Number.isInteger(manifest.maxRetries) || manifest.maxRetries < 0 || manifest.maxRetries > 2) fail("maxRetries must be an integer from 0 to 2");
   if (!Array.isArray(manifest.acceptanceCriteria) || !manifest.acceptanceCriteria.length) fail("acceptanceCriteria must be nonempty");

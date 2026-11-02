@@ -81,6 +81,72 @@ class WorkflowPolicyTests(unittest.TestCase):
                 result = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, f"{name}: {result.stderr}")
 
+    def test_functional_checker_runs_before_commit_and_uses_workflow_sha(self):
+        output_gate = step_run("Enforce single-file output")
+        self.assertIn("node .ados-policy/scripts/check_daily_practice.js daily-practice.html", output_gate)
+        self.assertLess(output_gate.index("check_daily_practice.js"), SOURCE.index("      - name: Preserve commit checkpoint"))
+        self.assertIn("ref: \${{ github.workflow_sha }}", SOURCE)
+        self.assertIn("id=completeButton", SOURCE)
+        self.assertIn("id=completionStatus", SOURCE)
+
+    def run_page_check(self, html: str):
+        with tempfile.TemporaryDirectory() as directory:
+            page = Path(directory) / "daily-practice.html"
+            page.write_text(html, encoding="utf-8")
+            return subprocess.run(
+                ["node", str(ROOT / "scripts/check_daily_practice.js"), str(page)],
+                text=True, capture_output=True, timeout=5,
+            )
+
+    def test_valid_page_passes_initial_click_and_reload_behavior(self):
+        html = """<!doctype html>
+<html><body>
+<h1>Daily Practice</h1>
+<button id="completeButton" type="button">Mark Complete</button>
+<p id="completionStatus" role="status" aria-live="polite">Not completed</p>
+<script>
+document.getElementById("completeButton").addEventListener("click", () => {
+  document.getElementById("completionStatus").textContent = "Completed";
+});
+</script>
+</body></html>"""
+        result = self.run_page_check(html)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("initial state, click transition, and reset on reload", result.stdout)
+
+    def test_noop_page_with_required_strings_is_rejected(self):
+        html = """<!doctype html>
+<html><body>
+<h1>Daily Practice</h1>
+<button id="completeButton" type="button">Mark Complete</button>
+<p id="completionStatus" role="status" aria-live="polite">Not completed</p>
+<p>Completed</p>
+<script>// no-op: required words are present, but the button does nothing</script>
+</body></html>"""
+        result = self.run_page_check(html)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("clicking Mark Complete did not change status", result.stderr)
+
+    def test_persisted_completion_is_rejected_after_reload(self):
+        html = """<!doctype html>
+<html><body>
+<h1>Daily Practice</h1>
+<button id="completeButton" type="button">Mark Complete</button>
+<p id="completionStatus" role="status" aria-live="polite">Not completed</p>
+<script>
+if (localStorage.getItem("completed") === "yes") {
+  document.getElementById("completionStatus").textContent = "Completed";
+}
+document.getElementById("completeButton").addEventListener("click", () => {
+  localStorage.setItem("completed", "yes");
+  document.getElementById("completionStatus").textContent = "Completed";
+});
+</script>
+</body></html>"""
+        result = self.run_page_check(html)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not reset after reload", result.stderr)
+
     def run_guard(self, *, issue_number="9", claim_count="0", run_record="41376777156\tissues\tfailure"):
         temp = tempfile.TemporaryDirectory()
         root = Path(temp.name)

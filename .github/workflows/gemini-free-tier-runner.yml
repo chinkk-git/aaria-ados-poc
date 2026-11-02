@@ -21,7 +21,7 @@ concurrency:
 jobs:
   preflight:
     if: github.repository == 'chinkk-git/aaria-ados-poc' && github.ref == 'refs/heads/main' && inputs.confirm_free_tier_and_no_billing == true
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -67,7 +67,7 @@ jobs:
               query = urllib.parse.urlencode({
                   "event": "workflow_dispatch", "per_page": "100", "page": str(page)
               })
-              url = "https://api.github.com/repos/" + repo + +                    "/actions/workflows/gemini-free-tier-runner.yml/runs?" + query
+              url = "https://api.github.com/repos/" + repo + "/actions/workflows/gemini-free-tier-runner.yml/runs?" + query
               request = urllib.request.Request(url, headers={
                   "Accept": "application/vnd.github+json",
                   "Authorization": "Bearer " + token,
@@ -103,7 +103,7 @@ jobs:
   generate-and-validate:
     needs: preflight
     if: github.repository == 'chinkk-git/aaria-ados-poc' && github.ref == 'refs/heads/main' && inputs.confirm_free_tier_and_no_billing == true
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 12
     permissions:
       contents: read

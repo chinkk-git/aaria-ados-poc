@@ -254,7 +254,10 @@ class OrchestrationTests(unittest.TestCase):
 
     def test_explicitly_approved_adapter_extension(self):
         adapter = FakeAdapter("approved_lab", "example-free", "result")
-        registry = ae.ProviderRegistry(approved_extensions=("approved_lab",))
+        registry = ae.ProviderRegistry(
+            approved_extensions=("approved_lab",),
+            verified_free_models={"approved_lab": "example-free"},
+        )
         registry.register(adapter, owner_approved=True)
         self.assertIs(registry.get("approved_lab"), adapter)
         with self.assertRaises(ae.ExecutorError):

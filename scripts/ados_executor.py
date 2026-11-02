@@ -606,9 +606,20 @@ class LocalHTTPAdapter:
 
 
 class ProviderRegistry:
-    def __init__(self, *, approved_extensions: Sequence[str] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        approved_extensions: Sequence[str] = (),
+        verified_free_models: Mapping[str, str] | None = None,
+    ) -> None:
         self._adapters: dict[str, ProviderAdapter] = {}
-        self._approved = {"local", "gemini", "openrouter", *approved_extensions}
+        # Candidate adapters are registered as code paths only. The Executor still
+        # requires verified zero-cost eligibility evidence before invoking any one.
+        self._approved = {
+            "local", "gemini", "openrouter", "groq", "nvidia_nim", "github_models",
+            *approved_extensions,
+        }
+        self._verified_free_models = dict(verified_free_models or {})
 
     def register(self, adapter: ProviderAdapter, *, owner_approved: bool) -> None:
         if not owner_approved:
@@ -617,6 +628,9 @@ class ProviderRegistry:
             raise ExecutorError("duplicate_provider_adapter")
         if adapter.name not in self._approved:
             raise ExecutorError("provider_not_allowlisted")
+        if adapter.name in {"groq", "nvidia_nim", "github_models", *self._approved.difference({"local", "gemini", "openrouter", "groq", "nvidia_nim", "github_models"})}:
+            if self._verified_free_models.get(adapter.name) != adapter.model:
+                raise ExecutorError("provider_requires_exact_verified_free_model")
         if adapter.name == "openrouter" and adapter.model != "openrouter/free":
             raise ExecutorError("paid_or_unapproved_openrouter_route")
         self._adapters[adapter.name] = adapter

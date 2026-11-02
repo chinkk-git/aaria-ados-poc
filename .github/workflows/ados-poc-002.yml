@@ -39,6 +39,14 @@ jobs:
           existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-poc-002" --state all --json number --jq 'length')"
           test "$existing" = "0" || { echo "REJECTED: existing PR"; exit 1; }
           echo "VERIFIED: exclusive branch ready"
+      - name: Enforce free-request budget before model invocation
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ADOS_QUOTA_RESERVE: '10'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/openrouter_quota_guard.py
       - name: Install pinned executor
         run: |
           set -euo pipefail

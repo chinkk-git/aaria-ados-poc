@@ -44,7 +44,7 @@ jobs:
   local-model-one-shot:
     needs: deterministic-tests
     if: >-
-      github.event.action == 'opened' &&
+      (github.event.action == 'opened' || github.event.action == 'synchronize') &&
       github.event.pull_request.head.repo.full_name == 'chinkk-git/aaria-ados-poc' &&
       github.event.pull_request.head.ref == 'experiment/python-multiprovider-executor' &&
       github.event.pull_request.user.login == 'chinkk-git' &&
@@ -74,12 +74,36 @@ jobs:
           test "$GITHUB_REPOSITORY" = "chinkk-git/aaria-ados-poc"
           test "$HEAD_BRANCH" = "experiment/python-multiprovider-executor"
           test "$CURRENT_ATTEMPT" = "1"
-          count="$(gh api --paginate --slurp \
+          runs_file="$RUNNER_TEMP/ados-workflow-runs.json"
+          gh api --paginate --slurp \
             "repos/$GH_REPOSITORY/actions/workflows/python-multiprovider-executor.yml/runs?branch=experiment%2Fpython-multiprovider-executor&per_page=100" \
-            --jq '[.[].workflow_runs[] | select(.id != (env.CURRENT_RUN_ID | tonumber))] | length')"
-          test "$count" = "0" || { echo "LOCAL_MODEL_BLOCKED: prior run exists; inference is one-time"; exit 1; }
+            > "$runs_file"
+          prior_count="$(jq --arg current "$CURRENT_RUN_ID" \
+            '[.[].workflow_runs[] | select((.id | tostring) != $current)] | length' "$runs_file")"
+          if [[ "$prior_count" == "1" ]]; then
+            prior_id="$(jq -r --arg current "$CURRENT_RUN_ID" \
+              '.[].workflow_runs[] | select((.id | tostring) != $current) | .id' "$runs_file")"
+            prior_run="$(gh api "repos/$GH_REPOSITORY/actions/runs/$prior_id")"
+            test "$(jq -r '.event + ":" + .conclusion + ":" + .head_branch' <<< "$prior_run")" = \
+              "pull_request:failure:experiment/python-multiprovider-executor" || {
+                echo "LOCAL_MODEL_BLOCKED: prior run was not a failed preflight run"; exit 1;
+              }
+            jobs_file="$RUNNER_TEMP/ados-prior-jobs.json"
+            gh api --paginate --slurp "repos/$GH_REPOSITORY/actions/runs/$prior_id/jobs?per_page=100" > "$jobs_file"
+            safe_resume="$(jq -r \
+              '[.[].jobs[] | select(.name == "local-model-one-shot") | .steps[] | select(.name == "Download one checksum-pinned local model" or .name == "Make exactly one local coding request") | .conclusion] as $steps | ($steps | length) == 2 and ($steps | all(. == "skipped"))' \
+              "$jobs_file")"
+            test "$safe_resume" = "true" || {
+              echo "LOCAL_MODEL_BLOCKED: prior run may have downloaded weights or invoked inference"; exit 1;
+            }
+            echo "SAFE_RECOVERY: prior run failed before model download and inference; one attempt remains"
+          elif [[ "$prior_count" != "0" ]]; then
+            echo "LOCAL_MODEL_BLOCKED: prior run history is ambiguous or an inference may already have occurred"
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/ados-evidence"
-          printf '{"one_shot_guard":"PASS","prior_workflow_runs":0,"run_id":%s,"attempt":%s}\n' \
+          printf '{"one_shot_guard":"PASS","prior_workflow_runs":%s,"safe_preflight_recovery":%s,"run_id":%s,"attempt":%s}\n' \
+            "$prior_count" "$([[ "$prior_count" == "1" ]] && echo true || echo false)" \
             "$CURRENT_RUN_ID" "$CURRENT_ATTEMPT" > "$RUNNER_TEMP/ados-evidence/one-shot-guard.json"
 
       - name: Verify pinned runtime source and its license before model download

@@ -1,0 +1,187 @@
+name: Python multi-provider executor experiment
+run-name: ADOS local model feasibility — ${{ github.event.pull_request.number }}
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [main]
+    paths:
+      - '.github/workflows/python-multiprovider-executor.yml'
+      - 'scripts/**'
+      - 'schemas/**'
+      - 'tasks/**'
+      - 'tests/**'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: python-multiprovider-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  deterministic-tests:
+    if: >-
+      github.event.pull_request.head.repo.full_name == 'chinkk-git/aaria-ados-poc' &&
+      github.event.pull_request.head.ref == 'experiment/python-multiprovider-executor' &&
+      github.event.pull_request.user.login == 'chinkk-git'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the reviewed experiment source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Run deterministic policy and adapter tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Check trusted browser harness syntax
+        run: node --check scripts/check_local_generated_page.cjs
+
+  local-model-one-shot:
+    needs: deterministic-tests
+    if: >-
+      github.event.action == 'opened' &&
+      github.event.pull_request.head.repo.full_name == 'chinkk-git/aaria-ados-poc' &&
+      github.event.pull_request.head.ref == 'experiment/python-multiprovider-executor' &&
+      github.event.pull_request.user.login == 'chinkk-git' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out the exact task revision without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Enforce a durable one-inference limit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          CURRENT_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "chinkk-git/aaria-ados-poc"
+          test "$HEAD_BRANCH" = "experiment/python-multiprovider-executor"
+          test "$CURRENT_ATTEMPT" = "1"
+          count="$(gh api --paginate --slurp \
+            "repos/$GH_REPOSITORY/actions/workflows/python-multiprovider-executor.yml/runs?branch=experiment%2Fpython-multiprovider-executor&per_page=100" \
+            --jq '[.[].workflow_runs[] | select(.id != (env.CURRENT_RUN_ID | tonumber))] | length')"
+          test "$count" = "0" || { echo "LOCAL_MODEL_BLOCKED: prior run exists; inference is one-time"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/ados-evidence"
+          printf '{"one_shot_guard":"PASS","prior_workflow_runs":0,"run_id":%s,"attempt":%s}\n' \
+            "$CURRENT_RUN_ID" "$CURRENT_ATTEMPT" > "$RUNNER_TEMP/ados-evidence/one-shot-guard.json"
+
+      - name: Verify pinned runtime source and its license before model download
+        env:
+          LLAMA_CPP_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/llama.cpp"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C "$source_dir" fetch --depth 1 origin "$LLAMA_CPP_COMMIT"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$LLAMA_CPP_COMMIT"
+          test -s "$source_dir/LICENSE"
+          grep -Fq "MIT License" "$source_dir/LICENSE"
+          echo "LLAMA_CPP_SOURCE: PASS; commit=$LLAMA_CPP_COMMIT; license=MIT"
+          cmake --version
+          cmake -S "$source_dir" -B "$source_dir/build" \
+            -DGGML_CUDA=OFF -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON
+          cmake --build "$source_dir/build" --target llama-server -j 4
+          test -x "$source_dir/build/bin/llama-server"
+          mkdir -p "$RUNNER_TEMP/ados-evidence"
+          printf '{"runtime_commit":"%s","runtime_license":"MIT","runtime_build":"PASS"}\n' \
+            "$LLAMA_CPP_COMMIT" > "$RUNNER_TEMP/ados-evidence/runtime.json"
+
+      - name: Install the fixed Playwright harness and pull pinned browser image
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/pw" --ignore-scripts --no-audit --no-fund playwright@1.64.1
+          docker pull mcr.microsoft.com/playwright:v1.64.1-noble
+
+      - name: Verify runner capacity, pinned model metadata, and zero-cost license
+        run: python3 scripts/local_model_preflight.py "$RUNNER_TEMP/ados-evidence/preflight.json"
+
+      - name: Verify the sandbox rejects no-op and persistent output
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_browser_check() {
+            candidate="$1"
+            docker run --rm --init --network none --read-only \
+              --user pwuser --cap-drop ALL --security-opt no-new-privileges \
+              --security-opt "seccomp=$GITHUB_WORKSPACE/tests/playwright-seccomp.json" \
+              --memory 1536m --cpus 2 --pids-limit 128 --shm-size 256m \
+              --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+              --tmpfs /home/pwuser/.cache:rw,nosuid,nodev,size=128m \
+              -e NODE_PATH=/playwright/node_modules \
+              -v "$RUNNER_TEMP/pw/node_modules:/playwright/node_modules:ro" \
+              -v "$GITHUB_WORKSPACE/scripts/check_local_generated_page.cjs:/test/check.cjs:ro" \
+              -v "$GITHUB_WORKSPACE/tests/fixtures:/fixtures:ro" \
+              -v "$GITHUB_WORKSPACE/tests/fixtures/$candidate:/candidate/daily-practice.html:ro" \
+              --entrypoint node mcr.microsoft.com/playwright:v1.64.1-noble /test/check.cjs
+          }
+          run_browser_check daily-practice-valid.html
+          if run_browser_check daily-practice-noop.html; then
+            echo "SANDBOX_POLICY_FAILURE: no-op fixture passed"
+            exit 1
+          fi
+          if run_browser_check daily-practice-persistent.html; then
+            echo "SANDBOX_POLICY_FAILURE: persistent-state fixture passed"
+            exit 1
+          fi
+          printf '{"valid_fixture":"PASS","no_op_fixture":"REJECTED","persistent_fixture":"REJECTED"}\n' \
+            > "$RUNNER_TEMP/ados-evidence/sandbox-policy.json"
+
+      - name: Download one checksum-pinned local model
+        run: python3 scripts/download_local_model.py "$RUNNER_TEMP/qwen-coder.gguf" "$RUNNER_TEMP/ados-evidence/download.json"
+
+      - name: Make exactly one local coding request
+        env:
+          LLAMA_SERVER_BIN: ${{ runner.temp }}/llama.cpp/build/bin/llama-server
+          LLAMA_CPP_EXPECTED_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
+        run: timeout --signal=TERM --kill-after=15s 16m python3 scripts/run_local_model_once.py "$RUNNER_TEMP/qwen-coder.gguf" "$RUNNER_TEMP/candidate/daily-practice.html" "$RUNNER_TEMP/ados-evidence/inference.json"
+
+      - name: Validate generated page inside the isolated browser container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --init --network none --read-only \
+            --user pwuser --cap-drop ALL --security-opt no-new-privileges \
+            --security-opt "seccomp=$GITHUB_WORKSPACE/tests/playwright-seccomp.json" \
+            --memory 1536m --cpus 2 --pids-limit 128 --shm-size 256m \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --tmpfs /home/pwuser/.cache:rw,nosuid,nodev,size=128m \
+            -e NODE_PATH=/playwright/node_modules \
+            -v "$RUNNER_TEMP/pw/node_modules:/playwright/node_modules:ro" \
+            -v "$GITHUB_WORKSPACE/scripts/check_local_generated_page.cjs:/test/check.cjs:ro" \
+            -v "$RUNNER_TEMP/candidate:/candidate:ro" \
+            --entrypoint node mcr.microsoft.com/playwright:v1.64.1-noble /test/check.cjs
+          printf '{"functional_validation":"PASS","candidate_commit":"none; feasibility only"}\n' \
+            > "$RUNNER_TEMP/ados-evidence/functional-validation.json"
+
+      - name: Upload bounded synthetic evidence without model weights or server logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: local-model-feasibility-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ados-evidence/*.json
+            ${{ runner.temp }}/candidate/daily-practice.html
+          if-no-files-found: ignore
+          retention-days: 90

@@ -301,11 +301,97 @@ class RemediationPolicyTests(unittest.TestCase):
         self.assertEqual(ae.recovery_action(provider_started=False, artifact_available=False,
                          provider_calls=0, **args), "EXECUTE_ONCE")
         self.assertEqual(ae.recovery_action(provider_started=True, artifact_available=False,
-                         provider_calls=1, **args), "BLOCK")
+                         provider_calls=1, **args), "BLOCKED_MISSING_WORKER_ARTIFACT")
         self.assertEqual(ae.recovery_action(provider_started=True, artifact_available=True,
                          provider_calls=1, **args), "ARTIFACT_ONLY")
         self.assertEqual(ae.recovery_action(provider_started=False, artifact_available=False,
-                         provider_calls=0, **{**args, "recovery_number": 3}), "BLOCK")
+                         provider_calls=0, **{**args, "recovery_number": 3}), "BLOCKED_RECOVERY_LIMIT")
+
+    def test_claim_write_failure_never_creates_branch_and_lease_retry_is_idempotent(self):
+        base = "a" * 40
+        state = {"claim": False, "branch_sha": None, "create_calls": 0, "claim_calls": 0}
+
+        def read_branch():
+            return state["branch_sha"]
+
+        def write_claim_failure():
+            state["claim_calls"] += 1
+            raise RuntimeError("simulated claim comment failure")
+
+        def create_branch(sha):
+            state["create_calls"] += 1
+            state["branch_sha"] = sha
+
+        with self.assertRaisesRegex(RuntimeError, "claim comment failure"):
+            ae.claim_then_acquire_dispatch_branch_lease(
+                expected_base_sha=base, same_run_claim=False, read_branch_sha=read_branch,
+                validate_provider=lambda: None, write_claim=write_claim_failure,
+                create_branch=create_branch)
+        self.assertIsNone(state["branch_sha"])
+        self.assertEqual(state["create_calls"], 0)
+
+        def durable_claim():
+            state["claim_calls"] += 1
+            state["claim"] = True
+
+        def create_then_interrupt(sha):
+            state["create_calls"] += 1
+            state["branch_sha"] = sha
+            raise RuntimeError("simulated interruption after branch creation")
+
+        with self.assertRaisesRegex(RuntimeError, "after branch creation"):
+            ae.claim_then_acquire_dispatch_branch_lease(
+                expected_base_sha=base, same_run_claim=False, read_branch_sha=read_branch,
+                validate_provider=lambda: None, write_claim=durable_claim,
+                create_branch=create_then_interrupt)
+        self.assertTrue(state["claim"])
+        self.assertEqual(state["branch_sha"], base)
+        create_calls_before_resume = state["create_calls"]
+        action = ae.claim_then_acquire_dispatch_branch_lease(
+            expected_base_sha=base, same_run_claim=True, read_branch_sha=read_branch,
+            validate_provider=lambda: self.fail("lease recovery must not repeat inference gating"),
+            write_claim=lambda: self.fail("lease recovery must not duplicate the claim comment"),
+            create_branch=create_branch)
+        self.assertEqual(action, "RECOVERED")
+        self.assertEqual(state["create_calls"], create_calls_before_resume)
+        self.assertEqual(state["claim_calls"], 2)
+
+    def test_existing_branch_cannot_be_reused_by_a_new_claim(self):
+        calls = []
+        with self.assertRaisesRegex(ae.DuplicateExecution, "dispatch_branch_preexisting"):
+            ae.claim_then_acquire_dispatch_branch_lease(
+                expected_base_sha="a" * 40, same_run_claim=False,
+                read_branch_sha=lambda: "a" * 40,
+                validate_provider=lambda: calls.append("validate"),
+                write_claim=lambda: calls.append("claim"),
+                create_branch=lambda _sha: calls.append("create"),
+            )
+        self.assertEqual(calls, [])
+
+    def test_local_qwen_eligibility_expires_and_is_rejected_at_point_of_use(self):
+        payload = {
+            "issue_number": 999, "authorized_actors": ["chinkk-git"],
+            "repository": "chinkk-git/aaria-ados-poc", "task_id": "ADOS-POC-999",
+            "branch": "experiment/ados-e01-synthetic", "expected_base_sha": "a" * 40,
+            "permitted_paths": ["daily-practice.html"], "task_prompt": "Synthetic task",
+            "acceptance_criteria": ["No inference"], "cost_ceiling_usd": 0.0,
+            "provider": "local", "provider_model": ae.LOCAL_QWEN_MODEL,
+            "provider_model_revision": ae.LOCAL_QWEN_REVISION,
+            "provider_model_sha256": ae.LOCAL_QWEN_SHA256,
+            "inference_authorization_id": "AUTH-SYNTHETIC-999",
+            "max_provider_calls": 1, "max_workflow_recoveries": 2, "enabled": True,
+        }
+        manifest = ae.parse_dispatch_manifest(payload)
+        record = {"provider": "local", "model": ae.LOCAL_QWEN_MODEL,
+                  "eligibility": "VERIFIED_ZERO_COST", "cost_authorized_usd": 0.0,
+                  "quota_status": "NOT_APPLICABLE", "last_verified_at": "1970-01-01T00:16:40Z"}
+        ae.validate_local_qwen_record(record, manifest, now_epoch=1500)
+        with self.assertRaisesRegex(ae.ExecutorError, "local_qwen_eligibility_stale"):
+            ae.validate_local_qwen_record(record, manifest, now_epoch=5000)
+        with self.assertRaisesRegex(ae.ExecutorError, "local_qwen_eligibility_stale"):
+            ae.validate_local_qwen_record(record, manifest, now_epoch=900)
+        with self.assertRaisesRegex(ae.ExecutorError, "local_qwen_eligibility_unverified"):
+            ae.validate_local_qwen_record({**record, "eligibility": "DISABLED"}, manifest, now_epoch=1500)
 
     def test_provider_record_requires_verified_zero_cost_and_available_quota(self):
         good = {"provider": "fixture", "model": "free-fixture", "eligibility": "VERIFIED_ZERO_COST",
@@ -337,8 +423,9 @@ class RemediationPolicyTests(unittest.TestCase):
         parsed = ae.parse_dispatch_manifest(payload)
         status = {"provider": "local", "model": parsed.provider_model,
                   "eligibility": "VERIFIED_ZERO_COST", "cost_authorized_usd": 0.0,
-                  "quota_status": "NOT_APPLICABLE"}
-        ae.validate_local_qwen_record(status, parsed)
+                  "quota_status": "NOT_APPLICABLE",
+                  "last_verified_at": "2026-01-01T00:00:00Z"}
+        ae.validate_local_qwen_record(status, parsed, now_epoch=1767225600)
         with self.assertRaisesRegex(ValueError, "dispatch_local_qwen_route_unapproved"):
             ae.parse_dispatch_manifest({**payload, "provider_model_revision": "0" * 40})
         with self.assertRaisesRegex(ValueError, "dispatch_inference_authorization_required"):

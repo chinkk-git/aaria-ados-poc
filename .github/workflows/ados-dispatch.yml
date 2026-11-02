@@ -185,45 +185,79 @@ jobs:
           import json, pathlib, sys
           data = json.loads(pathlib.Path(sys.argv[1]).read_text())
           with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
-              for key in ("task_id", "branch", "expected_base_sha", "event_key", "resume"):
+              for key in ("task_id", "branch", "expected_base_sha", "event_key", "resume", "provider_started"):
                   value = str(data[key]).lower() if isinstance(data[key], bool) else str(data[key])
                   output.write(f"{key}={value}\n")
           PY
-      - name: Verify authorized local Qwen backend before claiming
-        if: steps.preflight.outputs.resume != 'true'
-        env:
-          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PYQWEN'
-          import json, os, pathlib, sys
-          sys.path.insert(0, "scripts")
-          from ados_executor import parse_dispatch_manifest, validate_local_qwen_record
-          task = json.loads(pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text())
-          manifest = parse_dispatch_manifest(task)
-          provider = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
-          validate_local_qwen_record(provider, manifest)
-          PYQWEN
-
-      - name: Persist single-use task claim
-        if: steps.preflight.outputs.resume != 'true'
+      - name: Persist task claim before acquiring its branch lease
+        id: claim
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
           TASK_ID: ${{ steps.preflight.outputs.task_id }}
           EVENT_KEY: ${{ steps.preflight.outputs.event_key }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RESUME: ${{ steps.preflight.outputs.resume }}
+          PROVIDER_STARTED: ${{ steps.preflight.outputs.provider_started }}
           BRANCH: ${{ steps.preflight.outputs.branch }}
           EXPECTED_BASE_SHA: ${{ steps.preflight.outputs.expected_base_sha }}
+          REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$EXPECTED_BASE_SHA" >/dev/null
-          body="<!-- ADOS_DISPATCH_CLAIM task=$TASK_ID event=$EVENT_KEY run=$RUN_ID -->"
-          gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" -f body="$body" >/dev/null
-          started="<!-- ADOS_DISPATCH_PROVIDER_STARTED task=$TASK_ID event=$EVENT_KEY run=$RUN_ID -->"
-          gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" -f body="$started" >/dev/null
-          echo "CLAIMED: $TASK_ID for event $EVENT_KEY"
+          python3 - <<'PYCLAIM'
+          import json, os, pathlib, subprocess, sys, urllib.parse, time
+          sys.path.insert(0, "scripts")
+          from ados_executor import (claim_then_acquire_dispatch_branch_lease,
+                                     parse_dispatch_manifest, validate_local_qwen_record)
+          issue = os.environ["ISSUE_NUMBER"]
+          repo = os.environ["REPOSITORY"]
+          branch = os.environ["BRANCH"]
+          task = json.loads(pathlib.Path(f"tasks/issues/{issue}.json").read_text())
+          manifest = parse_dispatch_manifest(task)
+          provider = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
+
+          def gh(args):
+              return subprocess.run(["gh", *args], text=True, capture_output=True)
+
+          def read_branch_sha():
+              ref = "heads/" + urllib.parse.quote(branch, safe="")
+              result = gh(["api", f"repos/{repo}/git/ref/{ref}"])
+              if result.returncode:
+                  if "HTTP 404" in result.stderr or "HTTP 404" in result.stdout:
+                      return None
+                  raise RuntimeError("dispatch_branch_read_failed")
+              return json.loads(result.stdout)["object"]["sha"]
+
+          def write_claim():
+              marker = f"<!-- ADOS_DISPATCH_CLAIM task={manifest.task_id} event={os.environ['EVENT_KEY']} run={os.environ['RUN_ID']} -->"
+              result = gh(["api", f"repos/{repo}/issues/{issue}/comments", "-f", f"body={marker}"])
+              if result.returncode:
+                  raise RuntimeError("dispatch_claim_write_failed")
+
+          def create_branch(sha):
+              result = gh(["api", f"repos/{repo}/git/refs", "-f", f"ref=refs/heads/{branch}", "-f", f"sha={sha}"])
+              if result.returncode:
+                  raise RuntimeError("dispatch_branch_lease_create_failed")
+
+          action = claim_then_acquire_dispatch_branch_lease(
+              expected_base_sha=os.environ["EXPECTED_BASE_SHA"],
+              same_run_claim=os.environ["RESUME"] == "true",
+              read_branch_sha=read_branch_sha,
+              validate_provider=lambda: validate_local_qwen_record(provider, manifest, now_epoch=time.time()),
+              write_claim=write_claim,
+              create_branch=create_branch,
+          )
+          if os.environ["PROVIDER_STARTED"] != "true":
+              marker = f"<!-- ADOS_DISPATCH_PROVIDER_STARTED task={manifest.task_id} event={os.environ['EVENT_KEY']} run={os.environ['RUN_ID']} -->"
+              result = gh(["api", f"repos/{repo}/issues/{issue}/comments", "-f", f"body={marker}"])
+              if result.returncode:
+                  raise RuntimeError("dispatch_provider_start_marker_failed")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"lease_action={action}\n")
+          print(f"CLAIM_AND_LEASE={action} task={manifest.task_id}")
+          PYCLAIM
 
   execute:
     needs: [candidate, authorize]
@@ -242,9 +276,18 @@ jobs:
 
       - name: Recover the prior attempt's output artifact without repeating inference
         if: github.run_attempt > 1
+        id: recover_artifact
+        continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: ados-dispatch-${{ needs.authorize.outputs.event_key }}
+
+      - name: Fail closed when the prior worker artifact is missing
+        if: github.run_attempt > 1 && steps.recover_artifact.outcome != 'success'
+        run: |
+          echo "Recovery state: BLOCKED_MISSING_WORKER_ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Replay prevented::Prior worker artifact is missing; inference will not be repeated."
+          exit 1
 
       - name: Revalidate local Qwen task and prepare one-file prompt
         if: github.run_attempt == 1
@@ -328,6 +371,22 @@ jobs:
               output.write(f"evidence_path={evidence}\n")
               output.write(f"prompt_path={prompt}\n")
           PY
+
+      - name: Revalidate local Qwen eligibility immediately before inference
+        if: github.run_attempt == 1
+        env:
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYELIGIBILITY'
+          import json, os, pathlib, sys, time
+          sys.path.insert(0, "scripts")
+          from ados_executor import parse_dispatch_manifest, validate_local_qwen_record
+          manifest = parse_dispatch_manifest(json.loads(
+              pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text()))
+          provider = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
+          validate_local_qwen_record(provider, manifest, now_epoch=time.time())
+          PYELIGIBILITY
 
       - name: Make exactly one isolated local Qwen request
         if: github.run_attempt == 1

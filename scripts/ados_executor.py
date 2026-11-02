@@ -12,6 +12,7 @@ import re
 import subprocess
 import tempfile
 import time
+from datetime import datetime
 import urllib.error
 import urllib.request
 import uuid
@@ -401,6 +402,36 @@ def select_reconciliation_candidate(
             "branch": manifest.branch}
 
 
+def claim_then_acquire_dispatch_branch_lease(
+    *, expected_base_sha: str, same_run_claim: bool,
+    read_branch_sha: Callable[[], str | None],
+    validate_provider: Callable[[], None],
+    write_claim: Callable[[], None],
+    create_branch: Callable[[str], None],
+) -> str:
+    """Write the durable claim before creating its branch lease; resume only its own lease."""
+    branch_sha = read_branch_sha()
+    if same_run_claim:
+        if branch_sha == expected_base_sha:
+            return "RECOVERED"
+        if branch_sha is not None:
+            raise DuplicateExecution("dispatch_branch_reuse_or_advanced")
+    else:
+        if branch_sha is not None:
+            raise DuplicateExecution("dispatch_branch_preexisting")
+        validate_provider()
+        write_claim()
+        # A failed claim write exits above, so it cannot leave a branch without a claim.
+        branch_sha = read_branch_sha()
+        if branch_sha is not None:
+            raise DuplicateExecution("dispatch_branch_appeared_after_claim")
+
+    create_branch(expected_base_sha)
+    if read_branch_sha() != expected_base_sha:
+        raise LeaseHeld("dispatch_branch_lease_unverified")
+    return "CREATED"
+
+
 def dispatch_event_key(repository: str, issue_number: int, action: str,
                        created_at: str, manifest_bytes: bytes) -> str:
     """Stable idempotency key for duplicate deliveries of one issue-open event."""
@@ -489,8 +520,11 @@ MAX_LOCAL_QWEN_PROMPT_BYTES = 12_000
 MAX_LOCAL_QWEN_OUTPUT_BYTES = 100_000
 
 
-def validate_local_qwen_record(record: Mapping[str, object], manifest: DispatchManifest) -> None:
-    """Require a task-specific inference authorization and verified local zero-cost pin."""
+def validate_local_qwen_record(
+    record: Mapping[str, object], manifest: DispatchManifest, *,
+    now_epoch: float | None = None, max_age_seconds: int = 3600,
+) -> None:
+    """Require task authorization, a verified pin, and fresh eligibility at point of use."""
     if (manifest.provider != "local" or manifest.provider_model != LOCAL_QWEN_MODEL
             or manifest.provider_model_revision != LOCAL_QWEN_REVISION
             or manifest.provider_model_sha256 != LOCAL_QWEN_SHA256
@@ -501,6 +535,17 @@ def validate_local_qwen_record(record: Mapping[str, object], manifest: DispatchM
             or record.get("cost_authorized_usd") != 0.0
             or record.get("quota_status") != "NOT_APPLICABLE"):
         raise ExecutorError("local_qwen_eligibility_unverified")
+    verified_at = record.get("last_verified_at")
+    if not isinstance(verified_at, str):
+        raise ExecutorError("local_qwen_eligibility_timestamp_missing")
+    try:
+        verified_epoch = datetime.fromisoformat(verified_at.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ExecutorError("local_qwen_eligibility_timestamp_invalid") from exc
+    current_epoch = time.time() if now_epoch is None else now_epoch
+    age = current_epoch - verified_epoch
+    if age < 0 or age > max_age_seconds:
+        raise ExecutorError("local_qwen_eligibility_stale")
 
 
 def build_local_qwen_prompt(*, task_prompt: str, acceptance_criteria: Sequence[str],
@@ -547,11 +592,11 @@ def recovery_action(*, provider_started: bool, artifact_available: bool,
                     recovery_number: int, max_recoveries: int) -> str:
     """Decide recovery without replaying a possibly consumed provider call."""
     if recovery_number > max_recoveries:
-        return "BLOCK"
+        return "BLOCKED_RECOVERY_LIMIT"
     if artifact_available:
         return "ARTIFACT_ONLY"
     if provider_started or provider_calls >= max_provider_calls:
-        return "BLOCK"
+        return "BLOCKED_MISSING_WORKER_ARTIFACT"
     return "EXECUTE_ONCE"
 
 

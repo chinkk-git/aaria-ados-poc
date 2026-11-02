@@ -1,6 +1,9 @@
 """Focused tests for the Issue #9 artifact handoff authorization and recovery policy."""
 from pathlib import Path
+import os
 import re
+import subprocess
+import textwrap
 import unittest
 
 WORKFLOW = Path(".github/workflows/ados-artifact-handoff.yml").read_text(encoding="utf-8")
@@ -76,7 +79,7 @@ def base_state():
         "target_parent_count": 0,
         "target_digest": "",
         "target_files": [],
-        "comments": [[]],
+        "comments": [],
         "prior_run": {},
         "pr_merged": True,
         "live_pr_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -115,7 +118,7 @@ class HandoffPolicyTests(unittest.TestCase):
 
     def test_claim_exists_target_unchanged_resumes_same_claim(self):
         state = base_state()
-        state["comments"] = [[claim_comment()]]
+        state["comments"] = [claim_comment()]
         state["prior_run"] = run_record(conclusion="failure")
         result = POLICY["decide"](state)
         self.assertEqual(result["mode"], "resume_same_claim")
@@ -125,14 +128,14 @@ class HandoffPolicyTests(unittest.TestCase):
         state = base_state()
         legacy = claim_comment()
         legacy["body"] = "\\n".join(line for line in legacy["body"].splitlines() if not line.startswith("Reviewed PR head: "))
-        state["comments"] = [[legacy]]
+        state["comments"] = [legacy]
         state["prior_run"] = run_record(conclusion="cancelled")
         with self.assertRaises(POLICY["PolicyError"]):
             POLICY["decide"](state)
 
     def test_exact_committed_file_finalizes_without_push(self):
         state = base_state()
-        state["comments"] = [[claim_comment()]]
+        state["comments"] = [claim_comment()]
         state["prior_run"] = run_record(conclusion="cancelled")
         state.update({
             "target_head": COMMIT,
@@ -150,7 +153,7 @@ class HandoffPolicyTests(unittest.TestCase):
 
     def test_already_consumed_exact_commit_is_idempotent(self):
         state = base_state()
-        state["comments"] = [[claim_comment()], [{
+        state["comments"] = [claim_comment(), {
             "id": 10,
             "user": {"login": "github-actions[bot]"},
             "body": "\n".join((
@@ -161,7 +164,7 @@ class HandoffPolicyTests(unittest.TestCase):
                 f"Task branch commit: {COMMIT}",
                 "Only daily-practice.html was committed.",
             )),
-        }]]
+        }]
         state["prior_run"] = run_record(conclusion="success")
         state.update({
             "target_head": COMMIT,
@@ -177,30 +180,30 @@ class HandoffPolicyTests(unittest.TestCase):
 
     def test_duplicate_or_wrong_owner_claim_fails_closed(self):
         state = base_state()
-        state["comments"] = [[claim_comment(), claim_comment(run_id=1002)]]
+        state["comments"] = [claim_comment(), claim_comment(run_id=1002)]
         with self.assertRaises(POLICY["PolicyError"]):
             POLICY["decide"](state)
-        state["comments"] = [[claim_comment(author="chinkk-git")]]
+        state["comments"] = [claim_comment(author="chinkk-git")]
         state["prior_run"] = run_record(conclusion="failure")
         with self.assertRaises(POLICY["PolicyError"]):
             POLICY["decide"](state)
 
     def test_conflicting_target_and_active_or_successful_unchanged_run_fail_closed(self):
         state = base_state()
-        state["comments"] = [[claim_comment()]]
+        state["comments"] = [claim_comment()]
         state["prior_run"] = run_record(conclusion="failure")
         state["target_head"] = "dddddddddddddddddddddddddddddddddddddddd"
         with self.assertRaises(POLICY["PolicyError"]):
             POLICY["decide"](state)
         state = base_state()
-        state["comments"] = [[claim_comment()]]
+        state["comments"] = [claim_comment()]
         state["prior_run"] = run_record(conclusion="success")
         with self.assertRaises(POLICY["PolicyError"]):
             POLICY["decide"](state)
 
     def test_legacy_consumption_record_is_recognized_without_repush(self):
         state = base_state()
-        state["comments"] = [[claim_comment(), {
+        state["comments"] = [claim_comment(), {
             "id": 11,
             "user": {"login": "github-actions[bot]"},
             "body": "\n".join((
@@ -211,7 +214,7 @@ class HandoffPolicyTests(unittest.TestCase):
                 f"Task branch commit: {COMMIT}",
                 "Only daily-practice.html was committed.",
             )),
-        }]]
+        }]
         state["prior_run"] = run_record(conclusion="success")
         state.update({
             "target_head": COMMIT,
@@ -227,7 +230,7 @@ class HandoffPolicyTests(unittest.TestCase):
 
     def test_exact_file_with_wrong_parent_or_digest_fails_closed(self):
         state = base_state()
-        state["comments"] = [[claim_comment()]]
+        state["comments"] = [claim_comment()]
         state["prior_run"] = run_record(conclusion="cancelled")
         state.update({
             "target_head": COMMIT,
@@ -280,6 +283,92 @@ class HandoffPolicyTests(unittest.TestCase):
         self.assertIn('git ls-remote origin "refs/heads/$TARGET_BRANCH"', finalize)
         self.assertIn('test "$current_target" = "$COMMIT_SHA"', finalize)
         self.assertNotIn("git push", finalize)
+
+    def _script_for_step(self, step_name):
+        marker = f"      - name: {step_name}\n"
+        start = WORKFLOW.index(marker)
+        run_start = WORKFLOW.index("        run: |\n", start) + len("        run: |\n")
+        end = WORKFLOW.find("\n      - name:", run_start)
+        if end < 0:
+            end = len(WORKFLOW)
+        return textwrap.dedent(WORKFLOW[run_start:end])
+
+    def _writer_record(self, step_name, variable_name, env):
+        script = self._script_for_step(step_name)
+        start = script.index(f'{variable_name}="$(printf')
+        next_marker = "claim_comment_id=" if variable_name == "claim_body" else "gh api --method POST"
+        next_position = script.index(next_marker, start)
+        end = script.rfind("\n", start, next_position)
+        assignment = script[start:end].rstrip()
+        suffix = "\nprintf '%s' \"$" + variable_name + "\""
+        result = subprocess.run(
+            ["bash", "-c", assignment + suffix],
+            env={**os.environ, **env},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_flat_paginated_comment_payload_is_consumed_by_production_parser(self):
+        state = base_state()
+        first = {"id": 1, "user": {"login": "someone"}, "body": "ordinary comment"}
+        second = claim_comment()
+        state["comments"] = [first, second]
+        self.assertIn("comments:[$comments[][]]", WORKFLOW)
+        self.assertEqual(POLICY["_comments"](state), [first, second])
+        state["prior_run"] = run_record(conclusion="failure")
+        self.assertEqual(POLICY["decide"](state)["mode"], "resume_same_claim")
+        with self.assertRaises(POLICY["PolicyError"]):
+            POLICY["_comments"]({"comments": [[first], [second]]})
+
+    def test_workflow_generated_claim_and_consumption_records_round_trip(self):
+        env = {
+            "CLAIM_ID": CLAIM_ID,
+            "CLAIM_MARKER": CLAIM_MARKER,
+            "CONSUMED_MARKER": CONSUMED_MARKER,
+            "GITHUB_RUN_ID": "1001",
+            "SOURCE_COMMIT_SHA": SOURCE_SHA,
+            "AUTHORIZED_PR_HEAD": "b" * 40,
+            "SOURCE_PATH": "evidence/local-model-attempt-2-validated.html",
+            "SOURCE_SHA256": ARTIFACT_SHA,
+            "TARGET_BRANCH": "feature/ados-poc-002",
+            "EXPECTED_TARGET_SHA": EXPECTED,
+            "TARGET_PATH": "daily-practice.html",
+            "CLAIM_COMMENT_ID": "9",
+            "CLAIM_RUN_ID": "1001",
+            "COMMIT_SHA": COMMIT,
+        }
+        claim_body = self._writer_record(
+            "Reconcile authorization, claim and target state", "claim_body", env
+        )
+        self.assertIn("\nRun: 1001\n", claim_body)
+        self.assertNotIn("\\n", claim_body)
+        state = base_state()
+        state["comments"] = [{"id": 9, "user": {"login": "github-actions[bot]"}, "body": claim_body}]
+        state["prior_run"] = run_record(conclusion="failure")
+        self.assertEqual(POLICY["decide"](state)["mode"], "resume_same_claim")
+
+        consumed_body = self._writer_record("Record completed handoff", "body", env)
+        self.assertIn("\nClaim run: 1001\n", consumed_body)
+        self.assertNotIn("\\n", consumed_body)
+        state["comments"] = [
+            {"id": 9, "user": {"login": "github-actions[bot]"}, "body": claim_body},
+            {"id": 10, "user": {"login": "github-actions[bot]"}, "body": consumed_body},
+        ]
+        state["prior_run"] = run_record(conclusion="success")
+        state.update({
+            "target_head": COMMIT,
+            "target_file_exists": True,
+            "target_parent": EXPECTED,
+            "target_parent_count": 1,
+            "target_digest": ARTIFACT_SHA,
+            "target_mode": "100644",
+            "target_type": "blob",
+            "target_files": ["daily-practice.html"],
+        })
+        self.assertEqual(POLICY["decide"](state)["mode"], "already_finalized")
 
 
 if __name__ == "__main__":

@@ -178,10 +178,10 @@ jobs:
               return values[0]
 
           def _comments(data):
-              pages = data.get("comments", [])
-              if not isinstance(pages, list):
-                  raise PolicyError("comments_invalid")
-              return [comment for page in pages for comment in page]
+              comments = data.get("comments", [])
+              if not isinstance(comments, list) or any(not isinstance(comment, dict) for comment in comments):
+                  raise PolicyError("comments_shape_invalid")
+              return comments
 
           def _require_claim(comment, data):
               if comment.get("user", {}).get("login") != BOT:
@@ -320,7 +320,7 @@ jobs:
           mode="$(jq -r '.mode' <<< "$decision_json")"
           case "$mode" in
             new_claim)
-              claim_body="$(printf '%s\\n' \
+              claim_body="$(printf '%s\n' \
                 "$CLAIM_MARKER" \
                 "ADOS-POC-002 artifact handoff CLAIMED." \
                 "Claim ID: $CLAIM_ID" \
@@ -422,7 +422,7 @@ jobs:
           test -n "$CLAIM_COMMENT_ID"
           test -n "$CLAIM_RUN_ID"
           test -n "$COMMIT_SHA"
-          body="$(printf '%s\\n' \
+          body="$(printf '%s\n' \
             '<!-- ADOS_CONSUMED:ADOS-POC-002-ARTIFACT-HANDOFF-001 -->' \
             "Claim: $CLAIM_ID" \
             "Claim run: $CLAIM_RUN_ID" \

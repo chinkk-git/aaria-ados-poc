@@ -115,7 +115,14 @@ jobs:
           trap 'rm -f opencode.json' EXIT
           test -n "$OPENROUTER_API_KEY" || { echo "BLOCKED: OPENROUTER_API_KEY is not configured"; exit 1; }
           opencode run --standalone --auto --model openrouter/free \
-            "ADOS-POC-002. Create ONLY daily-practice.html: a self-contained accessible HTML page with a heading Daily Practice, a button Mark Complete, and a status indicator initially Not completed. Clicking the button changes status to Completed. Reload resets status to Not completed (no localStorage). Use no external dependencies, personal data, network calls, or other files. Do not edit index.html."
+            "ADOS-POC-002. Create ONLY daily-practice.html: a self-contained accessible HTML page with <h1>Daily Practice</h1>, a <button id=completeButton type=button>Mark Complete</button>, and a visible <p id=completionStatus role=status aria-live=polite>Not completed</p>. Inline JavaScript must attach a click listener using document.getElementById('completeButton') and set document.getElementById('completionStatus').textContent to Completed. A fresh page load must reset status to Not completed; do not persist state. Use no external dependencies, storage, personal data, network calls, or other files. Do not edit index.html."
+
+      - name: Checkout trusted functional checker
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ados-policy
+          persist-credentials: false
 
       - name: Enforce single-file output
         shell: bash

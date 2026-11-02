@@ -1,0 +1,101 @@
+name: ADOS focused CI and independent review
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - index.html
+      - test/**
+      - package.json
+      - task.json
+      - task.schema.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ados-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  focused-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Verify exact tested SHA and run focused behavior tests
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$EXPECTED_SHA"
+          echo "TESTED_SHA=$actual"
+          npm test
+
+  independent-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Install pinned OpenCode CLI
+        run: |
+          set -euo pipefail
+          npm install --global @opencode/cli@2.2.5
+          opencode --version
+
+      - name: Configure read-only review scope
+        run: |
+          set -euo pipefail
+          cat > opencode.json <<'JSON'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "permission": {
+              "*": "deny",
+              "read": {
+                "*": "allow",
+                "*.env": "deny",
+                "*.env.*": "deny"
+              },
+              "glob": "allow",
+              "grep": "allow",
+              "external_directory": "deny",
+              "bash": "deny",
+              "edit": "deny",
+              "task": "deny",
+              "webfetch": "deny",
+              "websearch": "deny",
+              "lsp": "deny",
+              "todowrite": "deny"
+            }
+          }
+          JSON
+
+      - name: Review implementation independently
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'rm -f opencode.json' EXIT
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$EXPECTED_SHA"
+          echo "REVIEWED_SHA=$actual"
+          opencode run --standalone --auto \
+            --model openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free \
+            "Independently review index.html against task.json acceptanceCriteria. Check functional correctness of initial 15:00 display, Start, Pause, resume, Reset to stopped 15:00, completion at zero, accessibility, and scope. Do not modify files. Output exactly one decision line: DECISION: PASS if criteria are met, otherwise DECISION: REQUEST_CHANGES. Then give concise evidence and any defects."

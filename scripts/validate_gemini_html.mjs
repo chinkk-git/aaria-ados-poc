@@ -72,11 +72,19 @@ export async function validateHtml(html) {
     // Explicitly enable Chromium's process sandbox. If it cannot start safely,
     // fail closed; never fall back to --no-sandbox or Node's vm module.
     stage = "browser-launch";
-    browser = await chromium.launch({
-      headless: true,
-      chromiumSandbox: true,
-      args: ["--disable-background-networking", "--disable-sync", "--no-first-run"]
-    });
+    try {
+      browser = await chromium.launch({
+        headless: true,
+        chromiumSandbox: true,
+        args: ["--disable-background-networking", "--disable-sync", "--no-first-run"]
+      });
+    } catch (error) {
+      const diagnostic = String(error && error.message || "")
+        .replace(/[A-Za-z0-9_-]{32,}/g, "[redacted-long-token-like-string]")
+        .slice(0, 1_200);
+      console.error("CHROMIUM_STARTUP_DIAGNOSTIC: " + diagnostic);
+      throw error;
+    }
     stage = "browser-context";
     const context = await browser.newContext({
       serviceWorkers: "block",

@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>15-Minute Timer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+        }
+        #timer {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            padding: 1rem;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .buttons {
+            display: flex;
+            gap: 1rem;
+        }
+        button {
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            cursor: pointer;
+            border: none;
+            border-radius: 4px;
+            background-color: #007bff;
+            color: white;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <div id="timer">15:00</div>
+    <div class="buttons">
+        <button id="start">Start</button>
+        <button id="pause">Pause</button>
+        <button id="reset">Reset</button>
+    </div>
+
+    <script>
+        let timeRemaining = 15 * 60; // 15 minutes in seconds
+        let intervalId;
+        let isRunning = false;
+
+        function formatTime(seconds) {
+            const minutes = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            return `${minutes}:${secs.toString().padStart(2, '0')}`;
+        }
+
+        function updateDisplay() {
+            document.getElementById('timer').textContent = formatTime(timeRemaining);
+        }
+
+        function startCountdown() {
+            if (!isRunning) {
+                intervalId = setInterval(() => {
+                    timeRemaining--;
+                    updateDisplay();
+                    if (timeRemaining <= 0) {
+                        clearInterval(intervalId);
+                        isRunning = false;
+                        document.getElementById('timer').textContent = '0:00';
+                    }
+                }, 1000);
+                isRunning = true;
+            }
+        }
+
+        function pauseCountdown() {
+            clearInterval(intervalId);
+            isRunning = false;
+        }
+
+        function resetTimer() {
+            clearInterval(intervalId);
+            timeRemaining = 15 * 60;
+            updateDisplay();
+            isRunning = false;
+        }
+
+        document.getElementById('start').addEventListener('click', startCountdown);
+        document.getElementById('pause').addEventListener('click', pauseCountdown);
+        document.getElementById('reset').addEventListener('click', resetTimer);
+
+        updateDisplay();
+    </script>
+</body>
+</html>

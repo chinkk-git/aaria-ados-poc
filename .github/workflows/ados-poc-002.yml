@@ -27,17 +27,21 @@ jobs:
   execute:
     if: >-
       github.actor == 'chinkk-git' &&
-      ((github.event_name == 'issues' &&
-      github.event.issue.user.login == 'chinkk-git' &&
-      github.event.issue.title == '[ADOS-POC-002] Daily Practice Complete') ||
-      (github.event_name == 'workflow_dispatch' &&
-      inputs.issue_number == '9' &&
-      inputs.resume_failed_run == '41376777156'))
+      (
+        (github.event_name == 'issues' &&
+         github.event.action == 'opened' &&
+         github.event.issue.number == 9 &&
+         github.event.issue.user.login == 'chinkk-git' &&
+         github.event.issue.title == '[ADOS-POC-002] Daily Practice Complete') ||
+        (github.event_name == 'workflow_dispatch' &&
+         inputs.issue_number == '9' &&
+         inputs.resume_failed_run == '41376777156')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
-      issues: read
+      issues: write
       actions: read
     steps:
       - name: Checkout exclusive task branch
@@ -49,22 +53,28 @@ jobs:
       - name: Enforce one-time resume and task scope
         env:
           GH_TOKEN: ${{ github.token }}
+          TASK_ISSUE_NUMBER: ${{ github.event_name == 'issues' && github.event.issue.number || inputs.issue_number }}
           RESUME_FAILED_RUN: ${{ inputs.resume_failed_run }}
         shell: bash
         run: |
           set -euo pipefail
+          test "$TASK_ISSUE_NUMBER" = "9" || { echo "REJECTED: task issue must be #9"; exit 1; }
           test ! -e daily-practice.html || { echo "REJECTED: output already exists"; exit 1; }
           test -z "$(git status --porcelain)" || { echo "REJECTED: dirty branch"; exit 1; }
-          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-poc-002" --state all --json number --jq 'length')"
-          test "$existing" = "0" || { echo "REJECTED: existing PR"; exit 1; }
+          existing_prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-poc-002" --state all --json number --jq 'length')"
+          test "$existing_prs" = "0" || { echo "REJECTED: task branch already has a PR"; exit 1; }
+
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            test "$RESUME_FAILED_RUN" = "41376777156" || { echo "REJECTED: resume must name the exact failed run"; exit 1; }
-            failed_run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RESUME_FAILED_RUN")"
-            printf '%s' "$failed_run" | jq -e '.id == 41376777156 and .event == "issues" and .conclusion == "failure"' >/dev/null || { echo "REJECTED: prior run is not the verified failed issue dispatch"; exit 1; }
-            previous_manual="$(gh run list --workflow .github/workflows/ados-poc-002.yml --event workflow_dispatch --limit 100 --json databaseId --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID)] | length")"
-            test "$previous_manual" = "0" || { echo "REJECTED: one-time resume was already used"; exit 1; }
+            test "$RESUME_FAILED_RUN" = "41376777156" || { echo "REJECTED: resume must identify the exact failed run"; exit 1; }
+            prior_run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/41376777156" --jq '[.id, .event, .conclusion] | @tsv')"
+            test "$prior_run" = $'41376777156\tissues\tfailure' || { echo "REJECTED: prior run is not the verified failed issue dispatch"; exit 1; }
+
+            claim_count="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/9/comments?per_page=100" --jq '[.[][] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- ADOS-POC-002-RESUME-CLAIM -->")))] | length')"
+            test "$claim_count" = "0" || { echo "REJECTED: one-time resume claim already exists"; exit 1; }
+            gh api "repos/$GITHUB_REPOSITORY/issues/9/comments" --method POST --field "body=<!-- ADOS-POC-002-RESUME-CLAIM --> run_id=$GITHUB_RUN_ID" >/dev/null
+            echo "RECORDED: durable one-time resume claim on Issue #9"
           fi
-          echo "VERIFIED: exclusive branch ready; manual resume allowance is unused"
+          echo "VERIFIED: issue, branch, output and PR scope checks passed"
 
       - name: Install pinned executor
         run: |
@@ -96,71 +106,29 @@ jobs:
           }
           JSON
 
-      - name: Run one free provider at a time with bounded failover
+      - name: Run OpenCode through the free-only OpenRouter route
         env:
-          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail
-          trap 'rm -f opencode.json /tmp/ados-worker-output.log' EXIT
-          prompt="ADOS-POC-002. Create ONLY daily-practice.html: a self-contained accessible HTML page with a heading Daily Practice, a button Mark Complete, and a status indicator initially Not completed. Clicking the button changes status to Completed. Reload resets status to Not completed (no localStorage). Use no external dependencies, personal data, network calls, or other files. Do not edit index.html."
-
-          attempt() {
-            local provider="$1"
-            local model="$2"
-            local rc=0
-            if [[ "$provider" == "gemini" ]]; then
-              env GOOGLE_GENERATIVE_AI_API_KEY="$GOOGLE_GENERATIVE_AI_API_KEY" \
-                opencode run --standalone --auto --model "$model" "$prompt" > /tmp/ados-worker-output.log 2>&1 || rc=$?
-            else
-              env OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
-                opencode run --standalone --auto --model "$model" "$prompt" > /tmp/ados-worker-output.log 2>&1 || rc=$?
-            fi
-            if (( rc == 0 )); then
-              echo "VERIFIED: executor completed using provider=$provider"
-              return 0
-            fi
-            if grep -Eiq '429|401|403|RESOURCE_EXHAUSTED|free-models-per-day|rate.?limit|quota|503|UNAVAILABLE|ECONNRESET|ETIMEDOUT|service unavailable' /tmp/ados-worker-output.log; then
-              echo "PROVIDER_UNAVAILABLE: provider=$provider; classified as capacity, authentication, or service failure"
-              rm -f daily-practice.html
-              return 75
-            fi
-            echo "WORKER_FAILED: provider=$provider; non-provider failure; no failover retry"
-            return "$rc"
-          }
-
-          succeeded=false
-          if [[ -n "${GOOGLE_GENERATIVE_AI_API_KEY:-}" ]]; then
-            if attempt gemini google/gemini-2.5-flash-lite; then
-              succeeded=true
-            else
-              rc=$?
-              (( rc == 75 )) || exit "$rc"
-            fi
-          else
-            echo "SKIPPED: Gemini secret is not configured"
-          fi
-
-          if [[ "$succeeded" != true ]]; then
-            test -n "${OPENROUTER_API_KEY:-}" || { echo "BLOCKED: no eligible free provider key is configured"; exit 1; }
-            if attempt openrouter openrouter/free; then
-              succeeded=true
-            else
-              rc=$?
-              (( rc == 75 )) && { echo "BLOCKED_QUOTA: both free providers unavailable"; exit 1; }
-              exit "$rc"
-            fi
-          fi
-          test "$succeeded" = true
+          trap 'rm -f opencode.json' EXIT
+          test -n "$OPENROUTER_API_KEY" || { echo "BLOCKED: OPENROUTER_API_KEY is not configured"; exit 1; }
+          opencode run --standalone --auto --model openrouter/free \
+            "ADOS-POC-002. Create ONLY daily-practice.html: a self-contained accessible HTML page with a heading Daily Practice, a button Mark Complete, and a status indicator initially Not completed. Clicking the button changes status to Completed. Reload resets status to Not completed (no localStorage). Use no external dependencies, personal data, network calls, or other files. Do not edit index.html."
 
       - name: Enforce single-file output
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git status --porcelain | sed 's/^...//')" = "daily-practice.html" || { echo "REJECTED: unexpected changes"; git status --short; exit 1; }
+          changed="$(git status --porcelain | sed 's/^...//')"
+          test "$changed" = "daily-practice.html" || { echo "REJECTED: unexpected changes"; git status --short; exit 1; }
           test -s daily-practice.html || { echo "REJECTED: empty output"; exit 1; }
-          echo "VERIFIED: only daily-practice.html changed"
+          grep -Fq '<h1>Daily Practice</h1>' daily-practice.html || { echo "REJECTED: missing page heading"; exit 1; }
+          grep -Fq 'Mark Complete' daily-practice.html || { echo "REJECTED: missing completion button"; exit 1; }
+          grep -Fq 'Not completed' daily-practice.html || { echo "REJECTED: missing initial state"; exit 1; }
+          grep -Fq 'Completed' daily-practice.html || { echo "REJECTED: missing completed state"; exit 1; }
+          echo "VERIFIED: only daily-practice.html changed and required content is present"
 
       - name: Preserve commit checkpoint
         env:

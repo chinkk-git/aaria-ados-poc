@@ -60,6 +60,7 @@ export async function validateHtml(html) {
   });
 
   let browser;
+  let stage = "server-listen";
   try {
     await new Promise((resolve, rejectPromise) => {
       server.once("error", rejectPromise);
@@ -70,11 +71,13 @@ export async function validateHtml(html) {
 
     // Explicitly enable Chromium's process sandbox. If it cannot start safely,
     // fail closed; never fall back to --no-sandbox or Node's vm module.
+    stage = "browser-launch";
     browser = await chromium.launch({
       headless: true,
       chromiumSandbox: true,
       args: ["--disable-background-networking", "--disable-sync", "--no-first-run"]
     });
+    stage = "browser-context";
     const context = await browser.newContext({
       serviceWorkers: "block",
       acceptDownloads: false
@@ -85,6 +88,7 @@ export async function validateHtml(html) {
     let pageErrors = 0;
     let popups = 0;
 
+    stage = "network-route";
     await context.route("**/*", async (route) => {
       const url = new URL(route.request().url());
       if (url.origin === origin) {
@@ -98,11 +102,13 @@ export async function validateHtml(html) {
       networkAttempts += 1;
       await route.abort("blockedbyclient");
     });
+    stage = "websocket-route";
     await context.routeWebSocket("**/*", (socket) => {
       networkAttempts += 1;
       socket.close();
     });
 
+    stage = "page-setup";
     const page = await context.newPage();
     page.setDefaultTimeout(5_000);
     page.on("pageerror", () => { pageErrors += 1; });
@@ -132,6 +138,7 @@ export async function validateHtml(html) {
       }
     });
 
+    stage = "page-load";
     await page.goto(origin + "/", { waitUntil: "load", timeout: 10_000 });
     const structure = await page.evaluate(() => ({
       lang: document.documentElement.getAttribute("lang"),
@@ -142,29 +149,40 @@ export async function validateHtml(html) {
       ).length,
       cspViolations: window.__adosCspViolationCount()
     }));
+    stage = "document-structure";
     if (!structure.doctype || !structure.lang || !structure.title) reject("document-structure");
     if (structure.externalAssets !== 0) reject("external-dependency");
+    stage = "heading";
     if (await page.getByRole("heading", { level: 1, name: "Daily Practice", exact: true }).count() !== 1) {
       reject("heading");
     }
+    stage = "accessible-button";
     const button = page.getByRole("button", { name: "Mark Complete", exact: true });
     if (await button.count() !== 1 || !(await button.isVisible()) || !(await button.isEnabled())) {
       reject("accessible-button");
     }
+    stage = "accessible-status";
     const status = page.getByRole("status");
     if (await status.count() !== 1 || (await status.getAttribute("aria-live")) !== "polite") {
       reject("accessible-status");
     }
+    stage = "initial-status";
     if ((await status.innerText()).trim() !== "Not completed") reject("initial-status");
 
+    stage = "button-click";
     await button.click();
+    stage = "completion";
     if ((await status.innerText()).trim() !== "Completed") reject("completion");
+    stage = "network-attempt";
     const afterClickViolations = await page.evaluate(() => window.__adosCspViolationCount());
     if (networkAttempts || afterClickViolations) reject("network-attempt");
+    stage = "reload";
     await page.reload({ waitUntil: "load", timeout: 10_000 });
+    stage = "reload-reset";
     const reloadedStatus = page.getByRole("status");
     if ((await reloadedStatus.innerText()).trim() !== "Not completed") reject("reload-reset");
 
+    stage = "network-result";
     if (networkAttempts || structure.cspViolations) reject("network-attempt");
     if (pageErrors) reject("browser-error");
     if (popups) reject("popup");
@@ -182,7 +200,7 @@ export async function validateHtml(html) {
     if (process.env.GEMINI_VALIDATOR_DEBUG === "1") {
       console.error("VALIDATOR_DEBUG:", error && error.name, error && error.message);
     }
-    reject("browser-isolation-or-runtime");
+    reject("runtime-" + stage);
   } finally {
     if (browser) await browser.close().catch(() => {});
     if (server.listening) {

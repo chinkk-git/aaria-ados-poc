@@ -17,11 +17,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-MODEL_REPO = "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF"
-MODEL_REVISION = "ebb2015119c907b064c512bf053e945850b5875f"
-MODEL_FILENAME = "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"
-MODEL_SIZE_BYTES = 491_400_064
-MODEL_SHA256 = "1d9614638d18024d0fbb36575a15f1302a3adf044df10345688ec4f6e1c4ff32"
+MODEL_REPO = "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
+MODEL_REVISION = "f86cb2c1fa58255f8052cc32aeede1b7482d4361"
+MODEL_FILENAME = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+MODEL_SIZE_BYTES = 1_117_320_768
+MODEL_SHA256 = "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046"
 MODEL_LICENSE = "Apache-2.0"
 LLAMA_CPP_COMMIT = "3f8af15a76ac8675812e856da45454bafc90f12c"
 LLAMA_CPP_LICENSE = "MIT"

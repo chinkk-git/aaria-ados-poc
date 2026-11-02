@@ -62,6 +62,7 @@ jobs:
           persist-credentials: false
 
       - name: Enforce a durable one-inference limit
+        id: one-shot-guard
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPOSITORY: ${{ github.repository }}
@@ -80,6 +81,10 @@ jobs:
             > "$runs_file"
           prior_count="$(jq --arg current "$CURRENT_RUN_ID" \
             '[.[].workflow_runs[] | select((.id | tostring) != $current)] | length' "$runs_file")"
+          second_attempt="false"
+          if jq -e '.attempt_id == "ADOS-LOCAL-INFERENCE-002" and .status == "OWNER_AUTHORIZED" and .authorization_count == 1 and .max_inference_requests == 1 and .external_api_requests_allowed == 0 and .no_paid_infrastructure == true and .no_automatic_retries == true and .preserve_original_one_shot_guard == true and .parent_attempt.workflow_run_id == 41470648697 and .parent_attempt.commit_sha == "157ba9063292d9e9451b1ebcc6649c95f376a6e5" and .parent_attempt.generated_output_sha256 == "f2891a03a3a3f7408107e1014d1f2643c0f186dc52e4dde2a4576ea9e2293185" and .model.repo == "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF" and .model.revision == "f86cb2c1fa58255f8052cc32aeede1b7482d4361" and .model.sha256 == "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046"' tasks/local-model-attempt-2.json >/dev/null; then
+            second_attempt="true"
+          fi
           if (( prior_count > 0 )); then
             while IFS= read -r prior_id; do
               prior_run="$(gh api "repos/$GH_REPOSITORY/actions/runs/$prior_id")"
@@ -90,6 +95,9 @@ jobs:
               esac
               jobs_file="$RUNNER_TEMP/ados-prior-jobs-$prior_id.json"
               gh api --paginate --slurp "repos/$GH_REPOSITORY/actions/runs/$prior_id/jobs?per_page=100" > "$jobs_file"
+              if [[ "$second_attempt" == "true" ]] && jq -e '[.[].jobs[] | select(.name == "local-model-one-shot") | .steps[]? | select(.name == "Claim authorized second inference") | select(.conclusion == "success" or .status == "in_progress")] | length > 0' "$jobs_file" >/dev/null; then
+                echo "LOCAL_MODEL_ATTEMPT_BLOCKED: second inference already claimed in run $prior_id"; exit 1
+              fi
               safe_resume="$(jq -r \
                 '[.[].jobs[] | select(.name == "local-model-one-shot")] as $jobs | if ($jobs | length) == 0 then true elif ($jobs | length) != 1 then false elif $jobs[0].conclusion == "skipped" then true else ([$jobs[0].steps[]? | select(.name == "Download one checksum-pinned local model" or .name == "Make exactly one local coding request") | .conclusion] as $steps | ($steps | length) == 2 and ($steps | all(. == "skipped"))) end' \
                 "$jobs_file")"
@@ -103,17 +111,45 @@ jobs:
                   echo "SAFE_RECOVERY: run $prior_id failed before reading model bytes; inference remained skipped"
                 fi
               fi
+              if [[ "$safe_resume" != "true" && "$second_attempt" == "true" && "$prior_id" == "41470648697" ]] &&
+                 [[ "$(jq -r '.head_sha' <<< "$prior_run")" == "157ba9063292d9e9451b1ebcc6649c95f376a6e5" ]]; then
+                parent_state="$(jq -r '[.[].jobs[] | select(.name == "local-model-one-shot") | .steps[]? | select(.name == "Download one checksum-pinned local model" or .name == "Make exactly one local coding request" or .name == "Validate generated page inside the isolated browser container") | .conclusion] | join(":")' "$jobs_file")"
+                artifact_present="$(gh api "repos/$GH_REPOSITORY/actions/runs/41470648697/artifacts" | jq -r '[.artifacts[] | select(.id == 13155402065)] | length == 1')"
+                if [[ "$parent_state" == "success:success:failure" && "$artifact_present" == "true" ]] &&
+                   [[ "$(sha256sum evidence/local-model-attempt-1-rejected.html | cut -d' ' -f1)" == "f2891a03a3a3f7408107e1014d1f2643c0f186dc52e4dde2a4576ea9e2293185" ]] &&
+                   jq -e '.attempt_id == "ADOS-LOCAL-INFERENCE-001" and .workflow_run_id == 41470648697 and (.browser_validation | startswith("FAIL:"))' evidence/local-model-attempt-1.json >/dev/null; then
+                  safe_resume="true"
+                  echo "SECOND_INFERENCE_PARENT_VERIFIED: original failed output, browser rejection, and consumed first attempt are preserved"
+                fi
+              fi
               test "$safe_resume" = "true" || {
                 echo "LOCAL_MODEL_BLOCKED: prior run $prior_id may have downloaded weights or invoked inference"; exit 1;
               }
             done < <(jq -r --arg current "$CURRENT_RUN_ID" \
               '.[].workflow_runs[] | select((.id | tostring) != $current) | .id' "$runs_file")
-            echo "SAFE_RECOVERY: all $prior_count prior runs stopped before model download and inference; one attempt remains"
+            if [[ "$second_attempt" == "true" ]]; then
+              echo "SECOND_INFERENCE_AUTHORIZED: all earlier runs reconciled; the separate attempt is claimed once"
+            else
+              echo "SAFE_RECOVERY: all $prior_count prior runs stopped before model download and inference; one attempt remains"
+            fi
           fi
           mkdir -p "$RUNNER_TEMP/ados-evidence"
-          printf '{"one_shot_guard":"PASS","prior_workflow_runs":%s,"safe_preflight_recovery":%s,"run_id":%s,"attempt":%s}\n' \
-            "$prior_count" "$([[ "$prior_count" -gt "0" ]] && echo true || echo false)" \
-            "$CURRENT_RUN_ID" "$CURRENT_ATTEMPT" > "$RUNNER_TEMP/ados-evidence/one-shot-guard.json"
+          preflight_recovery="false"
+          if [[ "$second_attempt" != "true" && "$prior_count" -gt "0" ]]; then preflight_recovery="true"; fi
+          printf '{"one_shot_guard":"PASS","prior_workflow_runs":%s,"safe_preflight_recovery":%s,"run_id":%s,"attempt":%s,"second_attempt":%s}\n' \
+            "$prior_count" "$preflight_recovery" \
+            "$CURRENT_RUN_ID" "$CURRENT_ATTEMPT" "$second_attempt" > "$RUNNER_TEMP/ados-evidence/one-shot-guard.json"
+          echo "second_attempt=$second_attempt" >> "$GITHUB_OUTPUT"
+
+      - name: Claim authorized second inference
+        if: steps.one-shot-guard.outputs.second_attempt == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(jq -r '.second_attempt' "$RUNNER_TEMP/ados-evidence/one-shot-guard.json")" = "true"
+          mkdir -p "$RUNNER_TEMP/ados-evidence"
+          jq -n --arg attempt_id "ADOS-LOCAL-INFERENCE-002" --arg run_id "$GITHUB_RUN_ID" --arg parent_run_id "41470648697" --arg source_sha "$GITHUB_SHA" '{attempt_id:$attempt_id,status:"CLAIMED",run_id:$run_id,parent_run_id:$parent_run_id,source_sha:$source_sha,inference_limit:1,api_requests_allowed:0}' > "$RUNNER_TEMP/ados-evidence/attempt-claim.json"
+          echo "SECOND_INFERENCE_CLAIMED: attempt=ADOS-LOCAL-INFERENCE-002; run=$GITHUB_RUN_ID"
 
       - name: Verify pinned runtime source and its license before model download
         env:
@@ -215,7 +251,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: local-model-feasibility-${{ github.run_id }}
+          name: local-model-attempt-2-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/ados-evidence/*.json
             ${{ runner.temp }}/candidate/daily-practice.html

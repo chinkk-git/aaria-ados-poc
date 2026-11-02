@@ -17,12 +17,17 @@ from local_model_preflight import MODEL_REPO, MODEL_REVISION, verify_model
 
 
 PROMPT = (
-    "Return one complete standalone HTML document and nothing else. It must have "
-    "the heading Daily Practice, a native accessible Mark Complete button, a "
-    "role=status aria-live=polite indicator initially saying Not completed, and "
-    "an inline click handler that changes the indicator to Completed. Reloading "
-    "must return to Not completed. Use no external resources, libraries, network "
-    "calls, or persistent storage. Include a doctype, lang, title, and main."
+    "Return only raw HTML. Do not use Markdown fences or explanations. "
+    "Keep the complete document under 45 lines and do not include CSS. "
+    "Create a complete HTML5 page with html lang=en, UTF-8 and viewport "
+    "metadata, title Daily Practice, and a main element. Inside main include "
+    "one h1 with the exact text Daily Practice, one p with id status, role "
+    "status and aria-live polite, initially displaying Not completed, and one "
+    "type=button button with id mark-complete and the exact label Mark Complete. "
+    "Use a short inline script to attach a click event listener to that button; "
+    "when clicked, change only the status paragraph text to Completed. "
+    "On page reload the initial HTML must again show Not completed. "
+    "Do not use external files, libraries, network requests, cookies, or storage."
 )
 BASE_URL = "http://127.0.0.1:8090"
 
@@ -96,7 +101,7 @@ def run(model_path: Path, output_path: Path, evidence_path: Path) -> dict[str, o
             "model": MODEL_REPO,
             "messages": [{"role": "user", "content": PROMPT}],
             "temperature": 0,
-            "max_tokens": 1200,
+            "max_tokens": 600,
             "stream": False,
         }).encode("utf-8")
         inference_started = time.monotonic()

@@ -1,0 +1,18 @@
+{
+  "attempt_id": "ADOS-LOCAL-INFERENCE-001",
+  "status": "FAILED_FUNCTIONAL_VALIDATION",
+  "workflow_run_id": 41470648697,
+  "commit_sha": "157ba9063292d9e9451b1ebcc6649c95f376a6e5",
+  "model": "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF",
+  "model_revision": "ebb2015119c907b064c512bf053e945850b5875f",
+  "model_sha256": "1d9614638d18024d0fbb36575a15f1302a3adf044df10345688ec4f6e1c4ff32",
+  "inference_requests": 1,
+  "inference_seconds": 25.507,
+  "output_tokens": 1200,
+  "output_token_limit": 1200,
+  "output_sha256": "f2891a03a3a3f7408107e1014d1f2643c0f186dc52e4dde2a4576ea9e2293185",
+  "artifact_id": 13155402065,
+  "root_cause": "Output began with Markdown fences, interpreted the prose accessibility requirement as repeated CSS selectors, and reached the 1200-token ceiling before producing click behavior.",
+  "browser_validation": "FAIL: status remained Not completed after clicking Mark Complete.",
+  "external_ai_api_requests": 0
+}

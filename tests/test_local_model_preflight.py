@@ -13,9 +13,12 @@ class LocalModelMetadataTests(unittest.TestCase):
         self.assertEqual(len(preflight.MODEL_REVISION), 40)
         self.assertEqual(len(preflight.MODEL_SHA256), 64)
         self.assertEqual(len(preflight.LLAMA_CPP_COMMIT), 40)
+        self.assertEqual(preflight.MODEL_REPO, "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF")
+        self.assertEqual(preflight.MODEL_REVISION, "f86cb2c1fa58255f8052cc32aeede1b7482d4361")
+        self.assertEqual(preflight.MODEL_SHA256, "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046")
         self.assertEqual(preflight.MODEL_LICENSE, "Apache-2.0")
         self.assertEqual(preflight.LLAMA_CPP_LICENSE, "MIT")
-        self.assertEqual(preflight.MODEL_SIZE_BYTES, 491_400_064)
+        self.assertEqual(preflight.MODEL_SIZE_BYTES, 1_117_320_768)
 
     def test_weight_verifier_rejects_wrong_size_without_network_or_model_call(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,8 +1,20 @@
 name: ADOS POC 002 isolated dispatch
-run-name: ADOS-POC-002 issue-${{ github.event.issue.number }}
+run-name: ADOS-POC-002 ${{ github.event_name == 'issues' && format('issue-{0}', github.event.issue.number) || format('resume-issue-{0}', inputs.issue_number) }}
 on:
   issues:
     types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Existing ADOS-POC-002 issue to resume
+        required: true
+        type: choice
+        options: ['9']
+      resume_failed_run:
+        description: Exact failed run to resume once
+        required: true
+        type: choice
+        options: ['41376777156']
 
 permissions:
   contents: read
@@ -15,35 +27,62 @@ jobs:
   execute:
     if: >-
       github.actor == 'chinkk-git' &&
-      github.event.issue.user.login == 'chinkk-git' &&
-      github.event.issue.title == '[ADOS-POC-002] Daily Practice Complete'
+      (
+        (github.event_name == 'issues' &&
+         github.event.action == 'opened' &&
+         github.event.issue.number == 9 &&
+         github.event.issue.user.login == 'chinkk-git' &&
+         github.event.issue.title == '[ADOS-POC-002] Daily Practice Complete') ||
+        (github.event_name == 'workflow_dispatch' &&
+         inputs.issue_number == '9' &&
+         inputs.resume_failed_run == '41376777156')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
-      issues: read
+      issues: write
+      pull-requests: write
+      actions: read
     steps:
       - name: Checkout exclusive task branch
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: feature/ados-poc-002
           persist-credentials: false
-      - name: Deterministic duplicate and scope preflight
+
+      - name: Enforce one-time resume and task scope
         env:
           GH_TOKEN: ${{ github.token }}
+          TASK_ISSUE_NUMBER: ${{ github.event_name == 'issues' && github.event.issue.number || inputs.issue_number }}
+          RESUME_FAILED_RUN: ${{ inputs.resume_failed_run }}
         shell: bash
         run: |
           set -euo pipefail
+          test "$TASK_ISSUE_NUMBER" = "9" || { echo "REJECTED: task issue must be #9"; exit 1; }
           test ! -e daily-practice.html || { echo "REJECTED: output already exists"; exit 1; }
           test -z "$(git status --porcelain)" || { echo "REJECTED: dirty branch"; exit 1; }
-          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-poc-002" --state all --json number --jq 'length')"
-          test "$existing" = "0" || { echo "REJECTED: existing PR"; exit 1; }
-          echo "VERIFIED: exclusive branch ready"
+          existing_prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-poc-002" --state all --json number --jq 'length')"
+          test "$existing_prs" = "0" || { echo "REJECTED: task branch already has a PR"; exit 1; }
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            test "$RESUME_FAILED_RUN" = "41376777156" || { echo "REJECTED: resume must identify the exact failed run"; exit 1; }
+            prior_run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/41376777156" --jq '[.id, .event, .conclusion] | @tsv')"
+            test "$prior_run" = $'41376777156\tissues\tfailure' || { echo "REJECTED: prior run is not the verified failed issue dispatch"; exit 1; }
+
+            claim_count="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/9/comments?per_page=100" --jq '[.[][] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- ADOS-POC-002-RESUME-CLAIM -->")))] | length')"
+            test "$claim_count" = "0" || { echo "REJECTED: one-time resume claim already exists"; exit 1; }
+            gh api "repos/$GITHUB_REPOSITORY/issues/9/comments" --method POST --field "body=<!-- ADOS-POC-002-RESUME-CLAIM --> run_id=$GITHUB_RUN_ID" >/dev/null
+            echo "RECORDED: durable one-time resume claim on Issue #9"
+          fi
+          echo "VERIFIED: issue, branch, output and PR scope checks passed"
+
       - name: Install pinned executor
         run: |
           set -euo pipefail
           npm install --global @opencode/cli@2.2.5
           opencode --version
+
       - name: Configure executor permissions
         shell: bash
         run: |
@@ -67,24 +106,37 @@ jobs:
             }
           }
           JSON
-      - name: Run OpenCode free-model worker
+
+      - name: Run OpenCode through the free-only OpenRouter route
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail
           trap 'rm -f opencode.json' EXIT
-          test -n "$OPENROUTER_API_KEY" || { echo "BLOCKED: missing secret"; exit 1; }
-          opencode run --standalone --auto \
-            --model openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free \
-            "ADOS-POC-002. Create ONLY daily-practice.html: a self-contained accessible HTML page with a heading Daily Practice, a button Mark Complete, and a status indicator initially Not completed. Clicking the button changes status to Completed. Reload resets status to Not completed (no localStorage). Use no external dependencies, personal data, network calls, or other files. Do not edit index.html."
+          test -n "$OPENROUTER_API_KEY" || { echo "BLOCKED: OPENROUTER_API_KEY is not configured"; exit 1; }
+          opencode run --standalone --auto --model openrouter/free \
+            "ADOS-POC-002. Create ONLY daily-practice.html: a self-contained accessible HTML page with <h1>Daily Practice</h1>, a <button id=completeButton type=button>Mark Complete</button>, and a visible <p id=completionStatus role=status aria-live=polite>Not completed</p>. Inline JavaScript must attach a click listener using document.getElementById('completeButton') and set document.getElementById('completionStatus').textContent to Completed. A fresh page load must reset status to Not completed; do not persist state. Use no external dependencies, storage, personal data, network calls, or other files. Do not edit index.html."
+
+      - name: Checkout trusted functional checker
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ados-policy
+          persist-credentials: false
+
       - name: Enforce single-file output
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git status --porcelain | sed 's/^...//')" = "daily-practice.html" || { echo "REJECTED: unexpected changes"; git status --short; exit 1; }
+          trap 'rm -rf .ados-policy' EXIT
           test -s daily-practice.html || { echo "REJECTED: empty output"; exit 1; }
-          echo "VERIFIED: only daily-practice.html changed"
+          node .ados-policy/scripts/check_daily_practice.js daily-practice.html
+          rm -rf .ados-policy
+          changed="$(git status --porcelain | sed 's/^...//')"
+          test "$changed" = "daily-practice.html" || { echo "REJECTED: unexpected changes"; git status --short; exit 1; }
+          echo "VERIFIED: only daily-practice.html changed and initial, click, and reload behavior passed"
+
       - name: Preserve commit checkpoint
         env:
           GH_TOKEN: ${{ github.token }}
@@ -97,4 +149,12 @@ jobs:
           git commit -m "feat: implement ADOS POC 002 practice indicator"
           gh auth setup-git
           git push origin HEAD:feature/ados-poc-002
-          echo "VERIFIED: implementation pushed; PR handoff via authorized connector"
+          existing_prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-poc-002" --state all --json number --jq 'length')"
+          test "$existing_prs" = "0" || { echo "REJECTED: PR appeared before handoff; will not create a duplicate"; exit 1; }
+          commit_sha="$(git rev-parse HEAD)"
+          gh pr create --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head feature/ados-poc-002 \
+            --title "[ADOS-POC-002] Daily Practice Complete" \
+            --body "Implements Issue #9 acceptance criteria. Verified task commit: $commit_sha. The functional output gate passed before commit."
+          echo "VERIFIED: implementation pushed and exactly one task PR created from $commit_sha"

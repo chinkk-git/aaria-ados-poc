@@ -28,6 +28,14 @@ SOURCE_SHA = "0b3dde4c94f045544632fe39d3fdc4c06bd55686"
 ARTIFACT_SHA = "f6b3e7d235ad13a6862e7c579598cc0ad7a0408c0a84d5a441f0e74f59eaf250"
 EXPECTED = "657e51007d9bb7cb95d9ca3931ec45da1c34c149"
 COMMIT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+LIVE_HEAD = "6af22af64878d1e1da539588713e5d3aba45feb4"
+COMPARE_COMMITS = [
+    "9d97c8f23f940313f5a3257aac1102e6b286ab6d",
+    "7d97769715069e1c21c2e98953afd338c0759604",
+    "da0fe4c165c0e003c37771b5eefb66b42d0e404d",
+    "f8775bb1baabb15320c3203df0c5e43f5da3aa09",
+    LIVE_HEAD,
+]
 
 
 def run_record(conclusion="cancelled", status="completed"):
@@ -53,7 +61,7 @@ def claim_comment(run_id=1001, author="github-actions[bot]"):
             f"Claim ID: {CLAIM_ID}",
             f"Run: {run_id}",
             f"Source: {SOURCE_SHA} (evidence/local-model-attempt-2-validated.html)",
-            "Reviewed PR head: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            f"Reviewed PR head: {LIVE_HEAD}",
             f"Artifact SHA-256: {ARTIFACT_SHA}",
             f"Target: feature/ados-poc-002 at {EXPECTED}",
             "Write scope: daily-practice.html only",
@@ -82,16 +90,22 @@ def base_state():
         "comments": [],
         "prior_run": {},
         "pr_merged": True,
-        "live_pr_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "live_pr_head": LIVE_HEAD,
         "live_pr_author": "chinkk-git",
-        "authorized_pr_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "authorized_pr_head": LIVE_HEAD,
         "live_pr_head_repo": "chinkk-git/aaria-ados-poc",
         "live_pr_head_ref": "experiment/python-multiprovider-executor",
+        # Captured GitHub REST compare response shape from run 41513347447:
+        # commits are chronological, total_commits is 5, and there is no head_commit.
         "compare": {
             "status": "ahead",
+            "ahead_by": 5,
+            "behind_by": 0,
+            "total_commits": 5,
             "base_commit": {"sha": SOURCE_SHA},
             "merge_base_commit": {"sha": SOURCE_SHA},
-            "head_commit": {"sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+            "commits": [{"sha": sha} for sha in COMPARE_COMMITS],
+            "files": [],
         },
     }
 
@@ -115,6 +129,25 @@ class HandoffPolicyTests(unittest.TestCase):
         self.assertIn('authorized_pr_head != live_pr_head', WORKFLOW)
         self.assertIn("Reviewed PR head: $AUTHORIZED_PR_HEAD", WORKFLOW)
         self.assertNotIn("APPROVED_PR_HEAD", WORKFLOW)
+
+    def test_actual_github_compare_response_binds_live_pr_head_without_head_commit(self):
+        state = base_state()
+        comparison = state["compare"]
+        self.assertNotIn("head_commit", comparison)
+        self.assertEqual(comparison["commits"][-1]["sha"], state["live_pr_head"])
+        POLICY["verify_reviewed_source"](
+            SOURCE_SHA, state["authorized_pr_head"], True, state["live_pr_head"],
+            "chinkk-git", state["live_pr_head_repo"], state["live_pr_head_ref"], comparison
+        )
+        self.assertIn('compare/$SOURCE_COMMIT_SHA...$live_pr_head', WORKFLOW)
+
+        mismatch = dict(comparison)
+        mismatch["commits"] = [*comparison["commits"][:-1], {"sha": "c" * 40}]
+        with self.assertRaises(POLICY["PolicyError"]):
+            POLICY["verify_reviewed_source"](
+                SOURCE_SHA, state["authorized_pr_head"], True, state["live_pr_head"],
+                "chinkk-git", state["live_pr_head_repo"], state["live_pr_head_ref"], mismatch
+            )
 
     def test_claim_exists_target_unchanged_resumes_same_claim(self):
         state = base_state()

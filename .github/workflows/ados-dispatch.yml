@@ -4,6 +4,8 @@ run-name: ADOS manifest dispatch
 on:
   issues:
     types: [opened]
+  repository_dispatch:
+    types: [ados-control-tower-resume]
   schedule:
     - cron: "*/5 * * * *"
 
@@ -21,6 +23,7 @@ jobs:
       issue_author: ${{ steps.select.outputs.issue_author }}
       created_at: ${{ steps.select.outputs.created_at }}
       action: ${{ steps.select.outputs.action }}
+      decision_id: ${{ steps.select.outputs.decision_id }}
     steps:
       - name: Check out trusted manifests from main
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -67,6 +70,7 @@ jobs:
           manifests = {}
           claimed = set()
           leased = set()
+          pending_resumes = []
           for issue in issues:
               number = int(issue["number"])
               manifest_path = pathlib.Path("tasks/issues") / f"{number}.json"
@@ -77,6 +81,21 @@ jobs:
               comments = json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp",
                   f"repos/{repo}/issues/{number}/comments"]))
               bodies = [c.get("body", "") for page in comments for c in page]
+              manifest_task = manifest.get("task_id")
+              existing_claims = set()
+              resume_markers = []
+              for body in bodies:
+                  claim_match = re.fullmatch(
+                      r"<!-- ADOS_DISPATCH_CLAIM task=(ADOS-POC-[0-9]{3}) event=([0-9a-f]{64}) run=([0-9]+) -->", body)
+                  if claim_match and claim_match.group(1) == manifest_task:
+                      existing_claims.add(claim_match.group(2))
+                  resume_match = re.fullmatch(
+                      r"<!-- ADOS_CONTROL_TOWER_RESUME task=(ADOS-POC-[0-9]{3}) decision=([0-9a-f]{64}) blocker=[0-9a-f]{64} authorization=AUTH-[A-Z0-9-]{1,64} source_run=[0-9]+ run=([0-9]+) -->", body)
+                  if resume_match and resume_match.group(1) == manifest_task:
+                      resume_markers.append(resume_match.group(2))
+              for decision in resume_markers:
+                  if decision not in existing_claims:
+                      pending_resumes.append((issue, manifest, decision, issue.get("user", {}).get("login")))
               own_claim = False
               if os.environ["RUN_ATTEMPT"] != "1":
                   for body in bodies:
@@ -94,16 +113,47 @@ jobs:
               if probe.returncode == 0 and not own_claim:
                   leased.add(manifest.get("branch", ""))
           event_number = int(os.environ["ISSUE_NUMBER"]) if os.environ["EVENT_NAME"] == "issues" else None
-          selected = select_reconciliation_candidate(
-              issues, manifests, claimed_issue_numbers=claimed, leased_branches=leased,
-              event_issue_number=event_number,
-              event_actor=os.environ["EVENT_ACTOR"] if os.environ["EVENT_NAME"] == "issues" else None)
+          decision_id = ""
+          if os.environ["EVENT_NAME"] == "repository_dispatch":
+              event = json.loads(pathlib.Path(os.environ["EVENT_PATH"]).read_text())
+              payload = event.get("client_payload", {})
+              number = payload.get("issue_number")
+              decision_id = payload.get("decision_id", "")
+              if type(number) is not int or not re.fullmatch(r"[0-9a-f]{64}", str(decision_id)):
+                  raise SystemExit("REJECTED: malformed Control Tower resume event")
+              response = subprocess.check_output(["gh", "api", f"repos/{repo}/issues/{number}"])
+              issue = json.loads(response)
+              if "pull_request" in issue or issue.get("state") != "open":
+                  raise SystemExit("REJECTED: resume target is not an open task issue")
+              issues = [issue]
+              if number not in manifests:
+                  raise SystemExit("REJECTED: resume task has no trusted main manifest")
+              author = issue.get("user", {}).get("login")
+              manifest = manifests[number]
+              if author not in manifest.get("authorized_actors", []):
+                  raise SystemExit("REJECTED: resume issue author is not authorized")
+              selected = {"issue_number": number, "issue_author": author,
+                          "created_at": issue["created_at"], "task_id": manifest["task_id"],
+                          "branch": manifest["branch"]}
+          elif os.environ["EVENT_NAME"] == "schedule" and pending_resumes:
+              issue, manifest, decision_id, author = min(
+                  pending_resumes, key=lambda row: (row[0].get("created_at", ""), row[0]["number"]))
+              selected = {"issue_number": issue["number"], "issue_author": author,
+                          "created_at": issue["created_at"], "task_id": manifest["task_id"],
+                          "branch": manifest["branch"]}
+          else:
+              selected = select_reconciliation_candidate(
+                  issues, manifests, claimed_issue_numbers=claimed, leased_branches=leased,
+                  event_issue_number=event_number,
+                  event_actor=os.environ["EVENT_ACTOR"] if os.environ["EVENT_NAME"] == "issues" else None)
           if selected is None:
-              chosen = {"issue_number": "", "issue_author": "", "created_at": "", "action": ""}
+              chosen = {"issue_number": "", "issue_author": "", "created_at": "", "action": "", "decision_id": ""}
           else:
               chosen = {"issue_number": selected["issue_number"], "issue_author": selected["issue_author"],
                         "created_at": selected["created_at"],
-                        "action": "opened" if os.environ["EVENT_NAME"] == "issues" else "reconcile"}
+                        "action": ("opened" if os.environ["EVENT_NAME"] == "issues" else
+                                   "control-tower-resume" if decision_id else "reconcile"),
+                        "decision_id": decision_id}
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               for key, value in chosen.items():
                   output.write(f"{key}={value}\n")
@@ -127,6 +177,7 @@ jobs:
       expected_base_sha: ${{ steps.preflight.outputs.expected_base_sha }}
       event_key: ${{ steps.preflight.outputs.event_key }}
       resume: ${{ steps.preflight.outputs.resume }}
+      authorized_resume: ${{ steps.preflight.outputs.authorized_resume }}
     steps:
       - name: Check out the trusted main manifest and validator
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -144,6 +195,7 @@ jobs:
           EVENT_ACTOR: ${{ needs.candidate.outputs.issue_author }}
           ISSUE_CREATED_AT: ${{ needs.candidate.outputs.created_at }}
           EVENT_ACTION: ${{ needs.candidate.outputs.action }}
+          RESUME_DECISION_ID: ${{ needs.candidate.outputs.decision_id }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -164,10 +216,11 @@ jobs:
           raw = json.loads(pathlib.Path(sys.argv[1]).read_text())
           runs = {}
           marker = re.compile(r"<!-- ADOS_DISPATCH_(?:CLAIM|CONSUMED|PROVIDER_STARTED) task=ADOS-POC-[0-9]{3} event=[0-9a-f]{64} run=([0-9]+) -->")
+          control_tower_marker = re.compile(r"<!-- ADOS_CONTROL_TOWER_(?:CONSUMED|DECISION|RESUME) task=ADOS-POC-[0-9]{3} decision=[0-9a-f]{64} blocker=[0-9a-f]{64} authorization=AUTH-[A-Z0-9-]{1,64} source_run=[0-9]+ run=([0-9]+) -->")
           for comment in raw:
               body = comment.get("body", "")
-              if "<!-- ADOS_DISPATCH_" in body:
-                  found = list(marker.finditer(body))
+              if "<!-- ADOS_DISPATCH_" in body or "<!-- ADOS_CONTROL_TOWER_" in body:
+                  found = list(marker.finditer(body)) if "<!-- ADOS_DISPATCH_" in body else list(control_tower_marker.finditer(body))
                   if len(found) != 1 or body.strip() != found[0].group(0):
                       raise SystemExit("REJECTED: malformed durable ledger marker")
                   run_id = found[0].group(1)
@@ -180,19 +233,23 @@ jobs:
                                       "head_branch": payload.get("head_branch"), "head_sha": payload.get("head_sha")}
           pathlib.Path(sys.argv[2]).write_text(json.dumps({"comments": raw, "runs": runs}))
           PYLEDGER
-          python3 scripts/ados_executor.py validate-dispatch \
+          dispatch_args=(validate-dispatch \
             --issue "$ISSUE_NUMBER" --actor "$EVENT_ACTOR" \
             --repository "$REPOSITORY" --trusted-revision-sha "$trusted_revision_sha" \
             --workflow-sha "$GITHUB_SHA" --current-main-sha "$current_main_sha" \
             --manifest-parent-sha "$manifest_parent_sha" \
             --created-at "$ISSUE_CREATED_AT" --action "$EVENT_ACTION" \
             --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
-            --comments-json "$RUNNER_TEMP/ados-ledger.json" > "$RUNNER_TEMP/ados-dispatch.json"
+            --comments-json "$RUNNER_TEMP/ados-ledger.json")
+          if [[ -n "$RESUME_DECISION_ID" ]]; then
+            dispatch_args+=(--resume-decision-id "$RESUME_DECISION_ID")
+          fi
+          python3 scripts/ados_executor.py "${dispatch_args[@]}" > "$RUNNER_TEMP/ados-dispatch.json"
           python3 - "$RUNNER_TEMP/ados-dispatch.json" "$GITHUB_OUTPUT" <<'PY'
           import json, pathlib, sys
           data = json.loads(pathlib.Path(sys.argv[1]).read_text())
           with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
-              for key in ("task_id", "branch", "expected_base_sha", "event_key", "resume", "provider_started"):
+              for key in ("task_id", "branch", "expected_base_sha", "event_key", "resume", "authorized_resume", "provider_started"):
                   value = str(data[key]).lower() if isinstance(data[key], bool) else str(data[key])
                   output.write(f"{key}={value}\n")
           PY
@@ -207,6 +264,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           RESUME: ${{ steps.preflight.outputs.resume }}
           PROVIDER_STARTED: ${{ steps.preflight.outputs.provider_started }}
+          AUTHORIZED_RESUME: ${{ steps.preflight.outputs.authorized_resume }}
           BRANCH: ${{ steps.preflight.outputs.branch }}
           EXPECTED_BASE_SHA: ${{ steps.preflight.outputs.expected_base_sha }}
           REPOSITORY: ${{ github.repository }}
@@ -251,6 +309,7 @@ jobs:
           action = claim_then_acquire_dispatch_branch_lease(
               expected_base_sha=os.environ["EXPECTED_BASE_SHA"],
               same_run_claim=os.environ["RESUME"] == "true",
+              authorized_resume=os.environ["AUTHORIZED_RESUME"] == "true",
               read_branch_sha=read_branch_sha,
               validate_provider=lambda: validate_local_qwen_record(provider, manifest, now_epoch=time.time()),
               write_claim=write_claim,

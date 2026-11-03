@@ -1,0 +1,423 @@
+name: ADOS Qwen Control Tower recovery
+run-name: ADOS Control Tower for run ${{ github.event.workflow_run.id }}
+
+on:
+  workflow_run:
+    workflows: [ADOS manifest-driven task dispatch]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: ados-control-tower-source-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      actions: read
+    outputs:
+      issue_number: ${{ steps.prepare.outputs.issue_number }}
+      task_id: ${{ steps.prepare.outputs.task_id }}
+      decision_id: ${{ steps.prepare.outputs.decision_id }}
+      blocker_sha256: ${{ steps.prepare.outputs.blocker_sha256 }}
+      authorization_id: ${{ steps.prepare.outputs.authorization_id }}
+      expected_base_sha: ${{ steps.prepare.outputs.expected_base_sha }}
+      branch: ${{ steps.prepare.outputs.branch }}
+    steps:
+      - name: Check out current trusted main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Resolve one authenticated pre-inference blocker
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          CT_RUN_ID: ${{ github.run_id }}
+          EVENT_PATH: ${{ github.event_path }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib, re, subprocess, sys, time, urllib.parse
+          sys.path.insert(0, "scripts")
+          from ados_executor import (build_control_tower_decision_prompt, control_tower_decision_id,
+              dispatch_ledger, parse_dispatch_manifest, validate_local_qwen_record)
+          repo = os.environ["REPOSITORY"]
+          source_id = int(os.environ["SOURCE_RUN_ID"])
+          main_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if main_sha != os.environ["SOURCE_HEAD_SHA"]:
+              raise SystemExit("BLOCKED: source run no longer identifies current trusted main")
+          def gh_json(path):
+              return json.loads(subprocess.check_output(["gh", "api", path]))
+          source_run = gh_json(f"repos/{repo}/actions/runs/{source_id}")
+          if (source_run.get("id") != source_id or source_run.get("path") != ".github/workflows/ados-dispatch.yml"
+              or source_run.get("head_branch") != "main" or source_run.get("head_sha") != main_sha
+              or source_run.get("conclusion") != "failure"):
+              raise SystemExit("BLOCKED: source workflow association is not trusted")
+          pages = json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp",
+              f"repos/{repo}/issues?state=open&per_page=100"]))
+          issues = [i for page in pages for i in page if "pull_request" not in i]
+          matches = []
+          for issue in issues:
+              number = issue["number"]
+              comments = json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp",
+                  f"repos/{repo}/issues/{number}/comments"]))
+              flat = [c for page in comments for c in page]
+              dispatch_markers = []
+              runs = {str(source_id): {"id": source_id, "repository": repo,
+                  "workflow_path": source_run.get("path"), "event": source_run.get("event"),
+                  "head_branch": source_run.get("head_branch"), "head_sha": source_run.get("head_sha")}}
+              marker_re = re.compile(r"<!-- ADOS_DISPATCH_(CLAIM|CONSUMED|PROVIDER_STARTED) task=(ADOS-POC-[0-9]{3}) event=([0-9a-f]{64}) run=([0-9]+) -->")
+              for comment in flat:
+                  body = comment.get("body", "")
+                  if "<!-- ADOS_DISPATCH_" not in body:
+                      continue
+                  found = list(marker_re.finditer(body))
+                  if len(found) != 1 or body.strip() != found[0].group(0):
+                      raise SystemExit("BLOCKED: malformed durable dispatch marker")
+                  run_id = found[0].group(4)
+                  if run_id not in runs:
+                      metadata = gh_json(f"repos/{repo}/actions/runs/{run_id}")
+                      runs[run_id] = {"id": metadata.get("id"), "repository": repo,
+                          "workflow_path": metadata.get("path"), "event": metadata.get("event"),
+                          "head_branch": metadata.get("head_branch"), "head_sha": metadata.get("head_sha")}
+              comments_for_ledger = [{"body": c.get("body", ""), "user_login": c.get("user", {}).get("login")} for c in flat]
+              events, consumed, claims, started = dispatch_ledger(comments_for_ledger, runs,
+                  repository=repo, expected_base_sha=main_sha)
+              for comment in flat:
+                  for match in marker_re.finditer(comment.get("body", "")):
+                      kind, task, event_key, run_id = match.groups()
+                      if run_id == str(source_id) and kind == "CLAIM":
+                          dispatch_markers.append((task, event_key))
+              if len(dispatch_markers) != 1:
+                  continue
+              task_id, event_key = dispatch_markers[0]
+              if event_key not in claims or claims[event_key] != str(source_id):
+                  continue
+              if event_key in started:
+                  continue
+              if task_id in consumed:
+                  continue
+              manifest_path = pathlib.Path("tasks/issues") / f"{number}.json"
+              if not manifest_path.is_file():
+                  continue
+              manifest = parse_dispatch_manifest(json.loads(manifest_path.read_text()))
+              if manifest.task_id != task_id or manifest.control_tower_decision_budget is None:
+                  continue
+              branch_ref = "heads/" + urllib.parse.quote(manifest.branch, safe="")
+              branch = gh_json(f"repos/{repo}/git/ref/{branch_ref}")
+              if branch.get("object", {}).get("sha") != main_sha:
+                  continue
+              provider = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
+              validate_local_qwen_record(provider, manifest, now_epoch=time.time())
+              jobs = gh_json(f"repos/{repo}/actions/runs/{source_id}/jobs?per_page=100").get("jobs", [])
+              failed = [{"name": j.get("name"), "conclusion": j.get("conclusion"),
+                         "failed_steps": [s.get("name") for s in j.get("steps", []) if s.get("conclusion") == "failure"]}
+                        for j in jobs if j.get("conclusion") == "failure"]
+              if not failed:
+                  continue
+              blocker = {"task_id": task_id, "source_run_id": source_id,
+                  "source_run_conclusion": "failure", "failure_stage": failed,
+                  "provider_started": False, "worker_provider_calls": 0,
+                  "branch_at_expected_base": True, "guard_category": "PRE_INFERENCE_TECHNICAL"}
+              prompt = build_control_tower_decision_prompt(task_id=task_id,
+                  permitted_paths=manifest.permitted_paths, blocker_record=blocker,
+                  budget=manifest.control_tower_decision_budget)
+              serialized = json.dumps(blocker, sort_keys=True, separators=(",", ":"))
+              digest = hashlib.sha256(serialized.encode()).hexdigest()
+              decision_id = control_tower_decision_id(task_id=task_id,
+                  blocker_sha256=digest,
+                  authorization_id=manifest.control_tower_decision_budget.authorization_id)
+              record = {"issue_number": number, "task_id": task_id, "source_run_id": source_id,
+                  "trusted_main_sha": main_sha, "event_key": event_key,
+                  "branch": manifest.branch,
+                  "expected_base_sha": main_sha, "blocker": blocker, "blocker_sha256": digest,
+                  "decision_id": decision_id, "prompt": prompt,
+                  "manifest": json.loads(manifest_path.read_text()),
+                  "authorization_id": manifest.control_tower_decision_budget.authorization_id}
+              output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "control-tower-input.json"
+              output.write_text(json.dumps(record, sort_keys=True))
+              with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+                  for key in ("issue_number", "task_id", "decision_id", "blocker_sha256", "authorization_id", "branch"):
+                      out.write(f"{key}={record[key]}\n")
+                  out.write(f"expected_base_sha={main_sha}\n")
+              break
+          else:
+              raise SystemExit("BLOCKED: no unique eligible unconsumed pre-inference task claim")
+          PY
+      - name: Preserve bounded input for isolated inference job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ados-control-tower-input-${{ github.run_id }}
+          path: ${{ runner.temp }}/control-tower-input.json
+          retention-days: 1
+
+  consume:
+    needs: prepare
+    if: needs.prepare.outputs.issue_number != ''
+    concurrency:
+      group: ados-control-tower-task-${{ needs.prepare.outputs.branch }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    steps:
+      - name: Check out exact trusted main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.expected_base_sha }}
+          persist-credentials: false
+      - name: Download bounded task and blocker packet
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ados-control-tower-input-${{ github.run_id }}
+      - name: Durably consume the one decision call before inference
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.prepare.outputs.issue_number }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          CT_RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_BASE_SHA: ${{ needs.prepare.outputs.expected_base_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_BASE_SHA" || { echo "BLOCKED: trusted main advanced before decision consumption"; exit 1; }
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys, time
+          sys.path.insert(0, "scripts")
+          from ados_executor import (assert_control_tower_budget_unconsumed,
+              control_tower_marker, parse_dispatch_manifest, validate_local_qwen_record)
+          record = json.loads(pathlib.Path("control-tower-input.json").read_text())
+          manifest = parse_dispatch_manifest(record["manifest"])
+          local = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
+          validate_local_qwen_record(local, manifest, now_epoch=time.time())
+          if int(os.environ["ISSUE_NUMBER"]) != record["issue_number"]:
+              raise SystemExit("REJECTED: task identity changed before decision consumption")
+          marker = control_tower_marker("CONSUMED", task_id=record["task_id"],
+              decision_id=record["decision_id"], blocker_sha256=record["blocker_sha256"],
+              authorization_id=record["authorization_id"],
+              source_run_id=int(os.environ["SOURCE_RUN_ID"]), workflow_run_id=int(os.environ["CT_RUN_ID"]))
+          comments = json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp",
+              f"repos/{os.environ['REPOSITORY']}/issues/{os.environ['ISSUE_NUMBER']}/comments"]))
+          flattened = [{"body": c.get("body", ""), "user_login": c.get("user", {}).get("login")}
+                       for page in comments for c in page]
+          assert_control_tower_budget_unconsumed(flattened, task_id=record["task_id"],
+              authorization_id=record["authorization_id"])
+          result = subprocess.run(["gh", "api", f"repos/{os.environ['REPOSITORY']}/issues/{os.environ['ISSUE_NUMBER']}/comments",
+              "-f", f"body={marker}"], capture_output=True, text=True)
+          if result.returncode:
+              raise SystemExit("BLOCKED: could not durably consume decision budget")
+          PY
+
+  decide:
+    needs: [prepare, consume]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact trusted main without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.expected_base_sha }}
+          persist-credentials: false
+      - name: Download bounded task and blocker packet
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ados-control-tower-input-${{ github.run_id }}
+      - name: Build the existing pinned llama.cpp runtime
+        env:
+          LLAMA_CPP_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/llama.cpp"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C "$source_dir" fetch --depth 1 origin "$LLAMA_CPP_COMMIT"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$LLAMA_CPP_COMMIT"
+          cmake -S "$source_dir" -B "$source_dir/build" -DGGML_CUDA=OFF -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+          cmake --build "$source_dir/build" --target llama-server -j 4
+      - name: Verify runtime capacity and pinned model metadata
+        run: python3 scripts/local_model_preflight.py "$RUNNER_TEMP/qwen-preflight.json"
+      - name: Download the same checksum-pinned Qwen model
+        run: python3 scripts/download_local_model.py "$RUNNER_TEMP/qwen-coder.gguf" "$RUNNER_TEMP/qwen-download.json"
+      - name: Revalidate eligibility immediately before the single decision call
+        env:
+          ISSUE_NUMBER: ${{ needs.prepare.outputs.issue_number }}
+          EXPECTED_BASE_SHA: ${{ needs.prepare.outputs.expected_base_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_BASE_SHA" || { echo "BLOCKED: trusted main advanced before inference"; exit 1; }
+          python3 - <<'PY'
+          import json, os, pathlib, sys, time
+          sys.path.insert(0, "scripts")
+          from ados_executor import parse_dispatch_manifest, validate_local_qwen_record
+          manifest = parse_dispatch_manifest(json.loads(pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text()))
+          status = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
+          validate_local_qwen_record(status, manifest, now_epoch=time.time())
+          PY
+      - name: Invoke Qwen exactly once without GitHub credentials
+        env:
+          LLAMA_SERVER_BIN: ${{ runner.temp }}/llama.cpp/build/bin/llama-server
+          LLAMA_CPP_EXPECTED_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
+          PROMPT_PATH: ${{ runner.temp }}/control-tower-prompt.txt
+          OUTPUT_PATH: ${{ runner.temp }}/control-tower-decision.json
+          EVIDENCE_PATH: ${{ runner.temp }}/control-tower-inference.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib
+          record = json.loads(pathlib.Path("control-tower-input.json").read_text())
+          pathlib.Path(os.environ["PROMPT_PATH"]).write_text(record["prompt"])
+          PY
+          timeout --signal=TERM --kill-after=15s 16m python3 scripts/run_local_model_once.py \
+            "$RUNNER_TEMP/qwen-coder.gguf" "$OUTPUT_PATH" "$EVIDENCE_PATH" "$PROMPT_PATH"
+      - name: Transfer only the bounded structured recommendation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ados-control-tower-decision-${{ github.run_id }}
+          path: ${{ runner.temp }}/control-tower-decision.json
+          retention-days: 1
+
+  publish_decision:
+    needs: [prepare, consume, decide]
+    if: always() && needs.prepare.result == 'success' && needs.consume.result == 'success' && needs.decide.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      actions: read
+    steps:
+      - name: Check out exact trusted main without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.expected_base_sha }}
+          persist-credentials: false
+      - name: Download task packet and structured recommendation
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ados-control-tower-input-${{ github.run_id }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ados-control-tower-decision-${{ github.run_id }}
+      - name: Validate recommendation, persist evidence, and resume only within the manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ needs.prepare.outputs.issue_number }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          CT_RUN_ID: ${{ github.run_id }}
+          EXPECTED_BASE_SHA: ${{ needs.prepare.outputs.expected_base_sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys, urllib.parse
+          sys.path.insert(0, "scripts")
+          from ados_executor import (authorize_builder_resume, control_tower_marker,
+              dispatch_ledger, parse_dispatch_manifest, validate_control_tower_decision,
+              validate_control_tower_ledger)
+          record = json.loads(pathlib.Path("control-tower-input.json").read_text())
+          manifest = parse_dispatch_manifest(record["manifest"])
+          raw = pathlib.Path("control-tower-decision.json").read_text()
+          decision = validate_control_tower_decision(raw, task_id=record["task_id"],
+              blocker_sha256=record["blocker_sha256"], budget=manifest.control_tower_decision_budget)
+          decision_id = record["decision_id"]
+          if decision["decision_id"] != decision_id:
+              raise SystemExit("REJECTED: decision ID does not match consumed budget")
+          raw_comments = json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp",
+              f"repos/{os.environ['REPOSITORY']}/issues/{os.environ['ISSUE_NUMBER']}/comments"]))
+          comments = [c for page in raw_comments for c in page]
+          dispatch_re = __import__("re").compile(r"<!-- ADOS_DISPATCH_(CLAIM|CONSUMED|PROVIDER_STARTED) task=(ADOS-POC-[0-9]{3}) event=([0-9a-f]{64}) run=([0-9]+) -->")
+          ct_re = __import__("re").compile(r"<!-- ADOS_CONTROL_TOWER_(?:CONSUMED|DECISION|RESUME) task=ADOS-POC-[0-9]{3} decision=[0-9a-f]{64} blocker=[0-9a-f]{64} authorization=AUTH-[A-Z0-9-]{1,64} source_run=[0-9]+ run=([0-9]+) -->")
+          workflow_runs = {}
+          for comment in comments:
+              body_text = comment.get("body", "")
+              for pattern in (dispatch_re, ct_re):
+                  for match in pattern.finditer(body_text):
+                      run_id = match.group(4) if pattern is dispatch_re else match.group(1)
+                      if run_id not in workflow_runs:
+                          metadata = json.loads(subprocess.check_output(["gh", "api",
+                              f"repos/{os.environ['REPOSITORY']}/actions/runs/{run_id}"]))
+                          workflow_runs[run_id] = {"id": metadata.get("id"),
+                              "repository": os.environ["REPOSITORY"], "workflow_path": metadata.get("path"),
+                              "event": metadata.get("event"), "head_branch": metadata.get("head_branch"),
+                              "head_sha": metadata.get("head_sha")}
+          normalized_comments = [{"body": c.get("body", ""), "user_login": c.get("user", {}).get("login")} for c in comments]
+          lifecycle = validate_control_tower_ledger(normalized_comments, workflow_runs,
+              repository=os.environ["REPOSITORY"], expected_main_sha=os.environ["EXPECTED_BASE_SHA"],
+              source_run_id=int(os.environ["SOURCE_RUN_ID"]), task_id=record["task_id"],
+              authorization_id=record["authorization_id"])
+          if lifecycle["CONSUMED"] != {decision_id} or lifecycle["DECISION"] or lifecycle["RESUME"]:
+              raise SystemExit("BLOCKED: durable decision lifecycle is absent or already advanced")
+          events, consumed, claims, started = dispatch_ledger(normalized_comments, workflow_runs,
+              repository=os.environ["REPOSITORY"], expected_base_sha=os.environ["EXPECTED_BASE_SHA"])
+          source_claims = [match.group(3) for comment in comments
+              for match in dispatch_re.finditer(comment.get("body", ""))
+              if match.group(1) == "CLAIM" and match.group(2) == record["task_id"]
+              and match.group(4) == os.environ["SOURCE_RUN_ID"]]
+          if len(source_claims) != 1 or claims.get(source_claims[0]) != os.environ["SOURCE_RUN_ID"]:
+              raise SystemExit("BLOCKED: source task claim is not authenticated")
+          if source_claims[0] in started or record["task_id"] in consumed:
+              raise SystemExit("BLOCKED: source provider call or task claim is consumed")
+          remote_main = subprocess.check_output(["git", "ls-remote", "origin", "refs/heads/main"], text=True).split()[0]
+          branch_ref = "heads/" + urllib.parse.quote(manifest.branch, safe="")
+          branch_payload = json.loads(subprocess.check_output(["gh", "api", f"repos/{os.environ['REPOSITORY']}/git/ref/{branch_ref}"]))
+          branch_at_base = branch_payload["object"]["sha"] == os.environ["EXPECTED_BASE_SHA"]
+          result = authorize_builder_resume(decision, task_id=record["task_id"],
+              blocker_sha256=record["blocker_sha256"], budget=manifest.control_tower_decision_budget,
+              trusted_guard_category=record["blocker"]["guard_category"], provider_started=False,
+              worker_provider_calls=0, resume_dispatches=0, branch_at_expected_base=branch_at_base,
+              claim_authenticated=True, task_unconsumed=record["task_id"] not in consumed)
+          if remote_main != os.environ["EXPECTED_BASE_SHA"]:
+              raise SystemExit("BLOCKED: main advanced before decision publication")
+          if result not in {"RESUME_ONCE", "BLOCKED_BY_CONTROL_TOWER", "OWNER_AUTHORIZATION_REQUIRED"}:
+              raise SystemExit("BLOCKED: deterministic Control Tower gate rejected recommendation")
+          kinds = ["DECISION"]
+          if result == "RESUME_ONCE":
+              kinds.append("RESUME")
+          for kind in kinds:
+              marker = control_tower_marker(kind, task_id=record["task_id"],
+                  decision_id=decision_id, blocker_sha256=record["blocker_sha256"],
+                  authorization_id=record["authorization_id"],
+                  source_run_id=int(os.environ["SOURCE_RUN_ID"]),
+                  workflow_run_id=int(os.environ["CT_RUN_ID"]))
+              subprocess.run(["gh", "api", f"repos/{os.environ['REPOSITORY']}/issues/{os.environ['ISSUE_NUMBER']}/comments",
+                  "-f", f"body={marker}"], check=True, stdout=subprocess.DEVNULL)
+          report = {"body": "## ADOS Control Tower decision\n\n"
+              + f"Task: `{record['task_id']}`; source workflow run: `{record['source_run_id']}`.\n\n"
+              + f"**Recommendation:** `{decision['decision']}`  \n"
+              + f"**Category:** `{decision['category']}`  \n"
+              + f"**Rationale:** {decision['rationale']}  \n"
+              + f"**Recommended action:** {decision['recommended_action']}  \n\n"
+              + f"**Deterministic gate:** `{result}`.\n\n"
+              + ("Builder resume was authorized once and dispatched automatically." if result == "RESUME_ONCE"
+                 else "No Builder resume was dispatched; the task remains blocked for deterministic review.")}
+          subprocess.run(["gh", "api", f"repos/{os.environ['REPOSITORY']}/issues/{os.environ['ISSUE_NUMBER']}/comments",
+              "--input", "-"], input=json.dumps(report), text=True, check=True,
+              stdout=subprocess.DEVNULL)
+          if result == "RESUME_ONCE":
+              body = {"event_type": "ados-control-tower-resume",
+                      "client_payload": {"issue_number": record["issue_number"], "decision_id": decision_id}}
+              subprocess.run(["gh", "api", f"repos/{os.environ['REPOSITORY']}/dispatches",
+                  "--input", "-"], input=json.dumps(body), text=True, check=True)
+          print(f"CONTROL_TOWER_RESULT={result}")
+          PY

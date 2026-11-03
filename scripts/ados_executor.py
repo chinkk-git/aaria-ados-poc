@@ -220,6 +220,96 @@ CONTROL_TOWER_GATED_CATEGORIES = frozenset(
 CONTROL_TOWER_DECISIONS = frozenset(
     {"RESUME_ONCE", "ARTIFACT_ONLY", "BLOCKED", "OWNER_AUTHORIZATION_REQUIRED"}
 )
+CONTROL_TOWER_MARKER = re.compile(
+    r"<!-- ADOS_CONTROL_TOWER_(CONSUMED|DECISION|RESUME) "
+    r"task=(ADOS-POC-[0-9]{3}) decision=([0-9a-f]{64}) blocker=([0-9a-f]{64}) "
+    r"authorization=(AUTH-[A-Z0-9-]{1,64}) source_run=([0-9]+) run=([0-9]+) -->"
+)
+
+
+def control_tower_marker(kind: str, *, task_id: str, decision_id: str,
+                         blocker_sha256: str, authorization_id: str, source_run_id: int,
+                         workflow_run_id: int) -> str:
+    """Format a single-use marker; callers must verify its GitHub run association."""
+    validate_task_id(task_id)
+    if kind not in {"CONSUMED", "DECISION", "RESUME"}:
+        raise ValueError("control_tower_marker_kind_invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", decision_id):
+        raise ValueError("control_tower_marker_decision_invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", blocker_sha256):
+        raise ValueError("control_tower_marker_blocker_invalid")
+    if not re.fullmatch(r"AUTH-[A-Z0-9-]{1,64}", authorization_id):
+        raise ValueError("control_tower_marker_authorization_invalid")
+    if type(source_run_id) is not int or source_run_id < 1 or type(workflow_run_id) is not int or workflow_run_id < 1:
+        raise ValueError("control_tower_marker_run_invalid")
+    return (f"<!-- ADOS_CONTROL_TOWER_{kind} task={task_id} decision={decision_id} blocker={blocker_sha256} "
+            f"authorization={authorization_id} source_run={source_run_id} run={workflow_run_id} -->")
+
+
+def validate_control_tower_ledger(
+    comments: Sequence[Mapping[str, object]],
+    workflow_runs: Mapping[str, Mapping[str, object]],
+    *, repository: str, expected_main_sha: str,
+    source_run_id: int, task_id: str, authorization_id: str,
+) -> dict[str, set[str]]:
+    """Authenticate one decision lifecycle through bot comments and Actions run metadata."""
+    if not exact_sha(expected_main_sha):
+        raise ValueError("control_tower_main_sha_invalid")
+    lifecycle: dict[str, set[str]] = {"CONSUMED": set(), "DECISION": set(), "RESUME": set()}
+    seen_markers: set[tuple[str, str]] = set()
+    for comment in comments:
+        body = comment.get("body") if isinstance(comment, Mapping) else None
+        if not isinstance(body, str) or "<!-- ADOS_CONTROL_TOWER_" not in body:
+            continue
+        matches = list(CONTROL_TOWER_MARKER.finditer(body))
+        if len(matches) != 1 or body.strip() != matches[0].group(0):
+            raise ValueError("control_tower_marker_malformed")
+        if comment.get("user_login") != "github-actions[bot]":
+            raise ValueError("control_tower_marker_forged")
+        kind, task, decision_id, blocker_sha256, auth_id, source_id, run_id = matches[0].groups()
+        if task != task_id or auth_id != authorization_id or int(source_id) != source_run_id:
+            raise ValueError("control_tower_marker_binding_invalid")
+        if control_tower_decision_id(task_id=task, blocker_sha256=blocker_sha256,
+                                     authorization_id=auth_id) != decision_id:
+            raise ValueError("control_tower_marker_decision_binding_invalid")
+        marker_key = (kind, decision_id)
+        if marker_key in seen_markers:
+            raise ValueError("control_tower_marker_duplicate")
+        seen_markers.add(marker_key)
+        run = workflow_runs.get(run_id)
+        if not isinstance(run, Mapping):
+            raise ValueError("control_tower_marker_run_missing")
+        if (run.get("id") != int(run_id) or run.get("repository") != repository
+                or run.get("workflow_path") != ".github/workflows/ados-control-tower.yml"
+                or run.get("event") != "workflow_run" or run.get("head_branch") != "main"
+                or run.get("head_sha") != expected_main_sha):
+            raise ValueError("control_tower_marker_run_unverified")
+        lifecycle[kind].add(decision_id)
+    if any(len(values) > 1 for values in lifecycle.values()):
+        raise ValueError("control_tower_marker_conflict")
+    return lifecycle
+
+
+def assert_control_tower_budget_unconsumed(
+    comments: Sequence[Mapping[str, object]], *, task_id: str, authorization_id: str,
+) -> None:
+    """Reject any prior or malformed consumption marker for this task authorization."""
+    validate_task_id(task_id)
+    if not re.fullmatch(r"AUTH-[A-Z0-9-]{1,64}", authorization_id):
+        raise ValueError("control_tower_marker_authorization_invalid")
+    for comment in comments:
+        body = comment.get("body") if isinstance(comment, Mapping) else None
+        if not isinstance(body, str) or "<!-- ADOS_CONTROL_TOWER_" not in body:
+            continue
+        matches = list(CONTROL_TOWER_MARKER.finditer(body))
+        if len(matches) != 1 or body.strip() != matches[0].group(0):
+            raise ValueError("control_tower_marker_malformed")
+        kind, marker_task, decision_id, blocker_sha256, marker_auth, _, _ = matches[0].groups()
+        if control_tower_decision_id(task_id=marker_task, blocker_sha256=blocker_sha256,
+                                     authorization_id=marker_auth) != decision_id:
+            raise ValueError("control_tower_marker_decision_binding_invalid")
+        if kind == "CONSUMED" and marker_task == task_id and marker_auth == authorization_id:
+            raise DuplicateExecution("control_tower_budget_already_consumed")
 
 
 def parse_control_tower_decision_budget(payload: object) -> ControlTowerDecisionBudget | None:
@@ -572,6 +662,7 @@ def select_reconciliation_candidate(
 
 def claim_then_acquire_dispatch_branch_lease(
     *, expected_base_sha: str, same_run_claim: bool,
+    authorized_resume: bool = False,
     read_branch_sha: Callable[[], str | None],
     validate_provider: Callable[[], None],
     write_claim: Callable[[], None],
@@ -579,6 +670,14 @@ def claim_then_acquire_dispatch_branch_lease(
 ) -> str:
     """Write the durable claim before creating its branch lease; resume only its own lease."""
     branch_sha = read_branch_sha()
+    if authorized_resume:
+        if branch_sha != expected_base_sha:
+            raise DuplicateExecution("dispatch_resume_branch_not_at_base")
+        validate_provider()
+        write_claim()
+        if read_branch_sha() != expected_base_sha:
+            raise DuplicateExecution("dispatch_resume_branch_advanced")
+        return "RECOVERED"
     if same_run_claim:
         if branch_sha == expected_base_sha:
             return "RECOVERED"
@@ -643,7 +742,7 @@ def dispatch_ledger(
             raise ValueError("dispatch_ledger_run_missing")
         if (run.get("repository") != repository
                 or run.get("workflow_path") != ".github/workflows/ados-dispatch.yml"
-                or run.get("event") not in {"issues", "schedule"}
+                or run.get("event") not in {"issues", "schedule", "repository_dispatch"}
                 or run.get("head_branch") != "main"
                 or run.get("head_sha") != expected_base_sha
                 or run.get("id") != int(run_id)):
@@ -1356,6 +1455,7 @@ def validate_dispatch_cli(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--comments-json", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--run-attempt", required=True, type=int)
+    parser.add_argument("--resume-decision-id")
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
     args = parser.parse_args(argv)
     ledger_payload = json.loads(args.comments_json.read_text(encoding="utf-8"))
@@ -1363,15 +1463,61 @@ def validate_dispatch_cli(argv: Sequence[str] | None = None) -> int:
         raise ValueError("dispatch_ledger_input_invalid")
     manifest_path = args.repository_root / "tasks" / "issues" / f"{args.issue}.json"
     manifest_bytes = manifest_path.read_bytes()
-    event_key = dispatch_event_key(
+    manifest_payload = json.loads(manifest_bytes)
+    manifest = parse_dispatch_manifest(manifest_payload)
+    event_key = args.resume_decision_id or dispatch_event_key(
         args.repository, args.issue, args.action, args.created_at, manifest_bytes
     )
     seen_events, consumed_tasks, claims, provider_started = dispatch_ledger(
         ledger_payload["comments"], ledger_payload["runs"], repository=args.repository,
         expected_base_sha=args.trusted_revision_sha)
+    resume_authorized = False
+    if args.resume_decision_id:
+        budget = manifest.control_tower_decision_budget
+        if budget is None or not re.fullmatch(r"[0-9a-f]{64}", args.resume_decision_id):
+            raise DuplicateExecution("control_tower_resume_not_authorized")
+        lifecycle = validate_control_tower_ledger(
+            ledger_payload["comments"], ledger_payload["runs"],
+            repository=args.repository, expected_main_sha=args.trusted_revision_sha,
+            source_run_id=next((int(match.group(6)) for comment in ledger_payload["comments"]
+                                if isinstance(comment, Mapping)
+                                for match in CONTROL_TOWER_MARKER.finditer(str(comment.get("body", "")))
+                                if match.group(5) == budget.authorization_id
+                                and match.group(2) == manifest.task_id
+                                and match.group(3) == args.resume_decision_id), -1),
+            task_id=manifest.task_id, authorization_id=budget.authorization_id,
+        )
+        if not all(args.resume_decision_id in lifecycle[kind]
+                   for kind in ("CONSUMED", "DECISION", "RESUME")):
+            raise DuplicateExecution("control_tower_resume_lifecycle_incomplete")
+        if args.resume_decision_id in seen_events or claims.get(args.resume_decision_id) is not None:
+            raise DuplicateExecution("control_tower_resume_event_already_claimed")
+        source_claim_events = {
+            match.group(3) for comment in ledger_payload["comments"]
+            if isinstance(comment, Mapping)
+            for match in DISPATCH_MARKER.finditer(str(comment.get("body", "")))
+            if match.group(1) == "CLAIM" and match.group(2) == manifest.task_id
+            and match.group(4) == str(next((int(m.group(6)) for c in ledger_payload["comments"]
+                if isinstance(c, Mapping) for m in CONTROL_TOWER_MARKER.finditer(str(c.get("body", "")))
+                if m.group(5) == budget.authorization_id and m.group(2) == manifest.task_id
+                and m.group(3) == args.resume_decision_id), -1))
+        }
+        if len(source_claim_events) != 1 or source_claim_events & provider_started:
+            raise DuplicateExecution("control_tower_provider_call_started_or_unverified")
+        task_claim_events = {
+            match.group(3) for comment in ledger_payload["comments"]
+            if isinstance(comment, Mapping)
+            for match in DISPATCH_MARKER.finditer(str(comment.get("body", "")))
+            if match.group(1) == "CLAIM" and match.group(2) == manifest.task_id
+        }
+        if task_claim_events & provider_started:
+            raise DuplicateExecution("control_tower_task_provider_call_started")
+        resume_authorized = True
     claim_run = claims.get(event_key)
     resumable_events: set[str] = set()
     if claim_run is not None and claim_run == args.run_id and args.run_attempt > 1:
+        resumable_events.add(event_key)
+    if resume_authorized:
         resumable_events.add(event_key)
     manifest = load_trusted_dispatch_manifest(
         args.repository_root, args.issue, actor=args.actor, repository=args.repository,
@@ -1404,7 +1550,8 @@ def validate_dispatch_cli(argv: Sequence[str] | None = None) -> int:
         "max_provider_calls": manifest.max_provider_calls,
         "max_workflow_recoveries": manifest.max_workflow_recoveries,
         "event_key": event_key,
-        "resume": event_key in resumable_events,
+        "resume": resume_authorized or event_key in resumable_events,
+        "authorized_resume": resume_authorized,
         "provider_started": event_key in provider_started,
     }, separators=(",", ":")))
     return 0

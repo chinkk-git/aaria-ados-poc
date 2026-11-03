@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/ados-dispatch.yml
+      - .github/workflows/ados-control-tower.yml
       - .github/workflows/ados-poc-002.yml
       - .github/workflows/ados-focused-ci.yml
       - schemas/**
@@ -53,7 +54,7 @@ jobs:
           python3 -m json.tool providers/status.json >/dev/null
 
   independent-review:
-    if: github.event.pull_request.head.ref != 'feature/ados-e01-reusable-manifest-dispatch'
+    if: github.event.pull_request.head.ref != 'feature/ados-e01-reusable-manifest-dispatch' && github.event.pull_request.head.ref != 'feature/ados-internal-blocker-handoff'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

@@ -861,5 +861,138 @@ class OrchestrationTests(unittest.TestCase):
             record.transition(ae.State.COMPLETE)
 
 
+class ControlTowerDecisionTests(unittest.TestCase):
+    def setUp(self):
+        self.budget = ae.parse_control_tower_decision_budget({
+            "authorization_id": "AUTH-SYNTHETIC-CT-001",
+            "max_calls": 1,
+            "max_resume_dispatches": 1,
+            "cost_ceiling_usd": 0.0,
+            "provider": "local",
+            "model": ae.LOCAL_QWEN_MODEL,
+            "model_revision": ae.LOCAL_QWEN_REVISION,
+            "model_sha256": ae.LOCAL_QWEN_SHA256,
+        })
+        self.blocker = {
+            "task_id": "ADOS-POC-999",
+            "failure_code": "RUNNER_SETUP_BEFORE_INFERENCE",
+            "provider_started": False,
+            "worker_provider_calls": 0,
+            "branch_at_expected_base": True,
+        }
+        self.serialized = json.dumps(self.blocker, sort_keys=True, separators=(",", ":"))
+        self.digest = ae.hashlib.sha256(self.serialized.encode()).hexdigest()
+
+    def decision(self, category="ROUTINE_TECHNICAL", action="RESUME_ONCE"):
+        payload = {
+            "schema_version": 1,
+            "decision_id": ae.control_tower_decision_id(
+                task_id="ADOS-POC-999", blocker_sha256=self.digest,
+                authorization_id=self.budget.authorization_id),
+            "task_id": "ADOS-POC-999",
+            "blocker_sha256": self.digest,
+            "category": category,
+            "decision": action,
+            "rationale": "Synthetic reasoning only; retry remains within the trusted task.",
+            "recommended_action": "Resume the one unused worker call.",
+        }
+        return ae.validate_control_tower_decision(
+            json.dumps(payload), task_id="ADOS-POC-999",
+            blocker_sha256=self.digest, budget=self.budget)
+
+    def test_fake_qwen_decision_parses_and_authorizes_one_safe_resume(self):
+        class FakeQwen:
+            calls = 0
+            def execute(self, _prompt):
+                self.calls += 1
+                return json.dumps({
+                    "schema_version": 1,
+                    "decision_id": ae.control_tower_decision_id(
+                        task_id="ADOS-POC-999", blocker_sha256=self.digest,
+                        authorization_id=self.budget.authorization_id),
+                    "task_id": "ADOS-POC-999", "blocker_sha256": self.digest,
+                    "category": "ROUTINE_TECHNICAL", "decision": "RESUME_ONCE",
+                    "rationale": "A pre-inference runner setup issue left the worker call unused.",
+                    "recommended_action": "Resume once within the existing task scope.",
+                })
+        fake = FakeQwen()
+        prompt = ae.build_control_tower_decision_prompt(
+            task_id="ADOS-POC-999", permitted_paths=["daily-practice.html"],
+            blocker_record=self.blocker, budget=self.budget)
+        decision = ae.validate_control_tower_decision(
+            fake.execute(prompt), task_id="ADOS-POC-999",
+            blocker_sha256=self.digest, budget=self.budget)
+        result = ae.authorize_builder_resume(
+            decision, task_id="ADOS-POC-999", blocker_sha256=self.digest,
+            budget=self.budget, trusted_guard_category="PRE_INFERENCE_TECHNICAL",
+            provider_started=False, worker_provider_calls=0, resume_dispatches=0,
+            branch_at_expected_base=True, claim_authenticated=True, task_unconsumed=True)
+        self.assertEqual(fake.calls, 1)
+        self.assertEqual(result, "RESUME_ONCE")
+        self.assertNotIn("GITHUB_TOKEN", prompt)
+        self.assertNotIn("run_local_model_once", prompt)
+
+    def test_qwen_decision_cannot_override_owner_gates_or_replay_controls(self):
+        unsafe_decision = self.decision(category="SECURITY")
+        self.assertEqual(ae.authorize_builder_resume(
+            unsafe_decision, task_id="ADOS-POC-999", blocker_sha256=self.digest,
+            budget=self.budget, trusted_guard_category="PRE_INFERENCE_TECHNICAL",
+            provider_started=False, worker_provider_calls=0, resume_dispatches=0,
+            branch_at_expected_base=True, claim_authenticated=True, task_unconsumed=True),
+            "OWNER_AUTHORIZATION_REQUIRED")
+        safe = self.decision()
+        cases = [
+            ({"provider_started": True}, "BLOCKED_PROVIDER_CALL_CONSUMED_OR_UNCERTAIN"),
+            ({"worker_provider_calls": 1}, "BLOCKED_PROVIDER_CALL_CONSUMED_OR_UNCERTAIN"),
+            ({"trusted_guard_category": "COST"}, "OWNER_AUTHORIZATION_REQUIRED"),
+            ({"resume_dispatches": 1}, "BLOCKED_RESUME_LIMIT"),
+            ({"branch_at_expected_base": False}, "BLOCKED_AUTHORIZATION_OR_LEASE"),
+            ({"claim_authenticated": False}, "BLOCKED_AUTHORIZATION_OR_LEASE"),
+            ({"task_unconsumed": False}, "BLOCKED_AUTHORIZATION_OR_LEASE"),
+        ]
+        base = dict(budget=self.budget, trusted_guard_category="PRE_INFERENCE_TECHNICAL",
+                    provider_started=False, worker_provider_calls=0, resume_dispatches=0,
+                    branch_at_expected_base=True, claim_authenticated=True, task_unconsumed=True)
+        for change, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(ae.authorize_builder_resume(
+                    safe, task_id="ADOS-POC-999", blocker_sha256=self.digest,
+                    **{**base, **change}), expected)
+
+    def test_decision_budget_is_separate_zero_cost_and_single_use(self):
+        with self.assertRaisesRegex(ValueError, "control_tower_budget_call_limit_invalid"):
+            ae.parse_control_tower_decision_budget({
+                "authorization_id": "AUTH-SYNTHETIC-CT-001", "max_calls": 2,
+                "max_resume_dispatches": 1, "cost_ceiling_usd": 0.0,
+                "provider": "local", "model": ae.LOCAL_QWEN_MODEL,
+                "model_revision": ae.LOCAL_QWEN_REVISION, "model_sha256": ae.LOCAL_QWEN_SHA256,
+            })
+        with self.assertRaisesRegex(ValueError, "control_tower_budget_cost_invalid"):
+            ae.parse_control_tower_decision_budget({
+                "authorization_id": "AUTH-SYNTHETIC-CT-001", "max_calls": 1,
+                "max_resume_dispatches": 1, "cost_ceiling_usd": 0.01,
+                "provider": "local", "model": ae.LOCAL_QWEN_MODEL,
+                "model_revision": ae.LOCAL_QWEN_REVISION, "model_sha256": ae.LOCAL_QWEN_SHA256,
+            })
+        self.assertIsNone(ae.parse_control_tower_decision_budget(None))
+        self.assertEqual(ae.authorize_builder_resume(
+            self.decision(), task_id="ADOS-POC-999", blocker_sha256=self.digest,
+            budget=None, trusted_guard_category="PRE_INFERENCE_TECHNICAL",
+            provider_started=False, worker_provider_calls=0, resume_dispatches=0,
+            branch_at_expected_base=True, claim_authenticated=True, task_unconsumed=True),
+            "BLOCKED_NO_DECISION_BUDGET")
+
+    def test_decision_output_binding_and_schema_are_strict(self):
+        valid = self.decision()
+        with self.assertRaisesRegex(ValueError, "control_tower_decision_binding_invalid"):
+            ae.validate_control_tower_decision(
+                json.dumps({**valid, "task_id": "ADOS-POC-001"}),
+                task_id="ADOS-POC-999", blocker_sha256=self.digest, budget=self.budget)
+        with self.assertRaisesRegex(ValueError, "control_tower_decision_fields_invalid"):
+            ae.validate_control_tower_decision(
+                json.dumps({**valid, "extra": "unsafe"}),
+                task_id="ADOS-POC-999", blocker_sha256=self.digest, budget=self.budget)
+
+
 if __name__ == "__main__":
     unittest.main()

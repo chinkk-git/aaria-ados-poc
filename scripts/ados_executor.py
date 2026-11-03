@@ -317,7 +317,10 @@ def load_trusted_dispatch_manifest(
     *,
     actor: str,
     repository: str,
-    base_sha: str,
+    trusted_revision_sha: str,
+    workflow_sha: str,
+    current_main_sha: str,
+    manifest_parent_sha: str,
     event_key: str,
     seen_event_keys: Sequence[str] = (),
     consumed_task_ids: Sequence[str] = (),
@@ -339,7 +342,16 @@ def load_trusted_dispatch_manifest(
         raise ValueError("dispatch_actor_mismatch")
     if repository != manifest.repository:
         raise ValueError("dispatch_repository_mismatch")
-    if base_sha != manifest.expected_base_sha:
+    # The manifest is committed on main, so it cannot contain the SHA of the
+    # commit that contains itself. Pin its intended base to that commit's first
+    # parent; use the immutable trusted manifest revision as the worker base.
+    if (not exact_sha(trusted_revision_sha)
+            or trusted_revision_sha != workflow_sha
+            or trusted_revision_sha != current_main_sha):
+        raise ValueError("dispatch_trusted_revision_stale")
+    if not exact_sha(manifest_parent_sha):
+        raise ValueError("dispatch_trusted_revision_invalid")
+    if manifest_parent_sha != manifest.expected_base_sha:
         raise ValueError("dispatch_stale_base_sha")
     if not isinstance(event_key, str) or not re.fullmatch(r"[0-9a-f]{64}", event_key):
         raise ValueError("dispatch_event_key_invalid")
@@ -1179,7 +1191,10 @@ def validate_dispatch_cli(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--issue", required=True, type=int)
     parser.add_argument("--actor", required=True)
     parser.add_argument("--repository", required=True)
-    parser.add_argument("--base-sha", required=True)
+    parser.add_argument("--trusted-revision-sha", required=True)
+    parser.add_argument("--workflow-sha", required=True)
+    parser.add_argument("--current-main-sha", required=True)
+    parser.add_argument("--manifest-parent-sha", required=True)
     parser.add_argument("--created-at", required=True)
     parser.add_argument("--action", required=True)
     parser.add_argument("--comments-json", required=True, type=Path)
@@ -1197,14 +1212,17 @@ def validate_dispatch_cli(argv: Sequence[str] | None = None) -> int:
     )
     seen_events, consumed_tasks, claims, provider_started = dispatch_ledger(
         ledger_payload["comments"], ledger_payload["runs"], repository=args.repository,
-        expected_base_sha=args.base_sha)
+        expected_base_sha=args.trusted_revision_sha)
     claim_run = claims.get(event_key)
     resumable_events: set[str] = set()
     if claim_run is not None and claim_run == args.run_id and args.run_attempt > 1:
         resumable_events.add(event_key)
     manifest = load_trusted_dispatch_manifest(
         args.repository_root, args.issue, actor=args.actor, repository=args.repository,
-        base_sha=args.base_sha, event_key=event_key,
+        trusted_revision_sha=args.trusted_revision_sha, workflow_sha=args.workflow_sha,
+        current_main_sha=args.current_main_sha,
+        manifest_parent_sha=args.manifest_parent_sha,
+        event_key=event_key,
         seen_event_keys=seen_events, consumed_task_ids=consumed_tasks,
         resumable_event_keys=resumable_events,
     )
@@ -1216,7 +1234,9 @@ def validate_dispatch_cli(argv: Sequence[str] | None = None) -> int:
         "issue_number": manifest.issue_number,
         "task_id": manifest.task_id,
         "branch": manifest.branch,
-        "expected_base_sha": manifest.expected_base_sha,
+        # This is the trusted manifest revision, and therefore the exact
+        # parent expected for the task branch and recovered checkpoint.
+        "expected_base_sha": args.trusted_revision_sha,
         "permitted_paths": list(manifest.permitted_paths),
         "task_prompt": manifest.task_prompt,
         "acceptance_criteria": list(manifest.acceptance_criteria),

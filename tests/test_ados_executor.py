@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -101,6 +102,7 @@ class DispatchValidationTests(unittest.TestCase):
         self.manifest_dir.mkdir(parents=True)
         self.issue = 999
         self.sha = "a" * 40
+        self.trusted_revision_sha = "c" * 40
         self.event_key = "b" * 64
         self.payload = {
             "issue_number": self.issue,
@@ -135,7 +137,10 @@ class DispatchValidationTests(unittest.TestCase):
         options = {
             "actor": "chinkk-git",
             "repository": "chinkk-git/aaria-ados-poc",
-            "base_sha": self.sha,
+            "trusted_revision_sha": self.trusted_revision_sha,
+            "workflow_sha": self.trusted_revision_sha,
+            "current_main_sha": self.trusted_revision_sha,
+            "manifest_parent_sha": self.sha,
             "event_key": self.event_key,
         }
         options.update(kwargs)
@@ -166,7 +171,9 @@ class DispatchValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dispatch_manifest_not_allowlisted"):
             ae.load_trusted_dispatch_manifest(
                 self.root, 998, actor="chinkk-git", repository="chinkk-git/aaria-ados-poc",
-                base_sha=self.sha, event_key=self.event_key,
+                trusted_revision_sha=self.trusted_revision_sha, workflow_sha=self.trusted_revision_sha,
+                current_main_sha=self.trusted_revision_sha, manifest_parent_sha=self.sha,
+                event_key=self.event_key,
             )
 
     def test_actor_mismatch_is_rejected(self):
@@ -186,9 +193,54 @@ class DispatchValidationTests(unittest.TestCase):
             self.resolve()
         self.write_manifest()
 
-    def test_stale_base_sha_is_rejected(self):
+    def test_stale_manifest_parent_sha_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "dispatch_stale_base_sha"):
-            self.resolve(base_sha="c" * 40)
+            self.resolve(manifest_parent_sha="d" * 40)
+
+    def test_stale_workflow_or_current_main_revision_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "dispatch_trusted_revision_stale"):
+            self.resolve(workflow_sha="d" * 40)
+        with self.assertRaisesRegex(ValueError, "dispatch_trusted_revision_stale"):
+            self.resolve(current_main_sha="d" * 40)
+
+    def test_committed_manifest_resolves_against_immutable_first_parent(self):
+        repo = self.root / "committed-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "ADOS Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "ados-test@example.invalid"], check=True)
+        (repo / "README.md").write_text("trusted base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "trusted base"], check=True)
+        parent_sha = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        manifest_dir = repo / "tasks" / "issues"
+        manifest_dir.mkdir(parents=True)
+        payload = dict(self.payload, expected_base_sha=parent_sha)
+        (manifest_dir / "999.json").write_text(json.dumps(payload), encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tasks/issues/999.json"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "add trusted manifest"], check=True)
+        trusted_revision_sha = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        committed_parent = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD^1"], text=True
+        ).strip()
+        self.assertEqual(committed_parent, parent_sha)
+        manifest = ae.load_trusted_dispatch_manifest(
+            repo, 999, actor="chinkk-git", repository="chinkk-git/aaria-ados-poc",
+            trusted_revision_sha=trusted_revision_sha, workflow_sha=trusted_revision_sha,
+            current_main_sha=trusted_revision_sha, manifest_parent_sha=committed_parent,
+            event_key=self.event_key,
+        )
+        self.assertEqual(manifest.expected_base_sha, parent_sha)
+
+    def test_altered_manifest_parent_is_rejected_against_committed_revision(self):
+        payload = dict(self.payload, expected_base_sha="d" * 40)
+        self.write_manifest(payload)
+        with self.assertRaisesRegex(ValueError, "dispatch_stale_base_sha"):
+            self.resolve()
 
     def test_repository_task_binding_cost_and_attempt_limits_are_enforced(self):
         with self.assertRaisesRegex(ValueError, "dispatch_repository_mismatch"):
@@ -221,7 +273,9 @@ class DispatchValidationTests(unittest.TestCase):
     def test_unconsumed_checkpoint_can_resume_only_under_original_run(self):
         resumed = ae.load_trusted_dispatch_manifest(
             self.root, self.issue, actor="chinkk-git", repository="chinkk-git/aaria-ados-poc",
-            base_sha=self.sha, event_key=self.event_key,
+            trusted_revision_sha=self.trusted_revision_sha, workflow_sha=self.trusted_revision_sha,
+            current_main_sha=self.trusted_revision_sha, manifest_parent_sha=self.sha,
+            event_key=self.event_key,
             seen_event_keys=[self.event_key], resumable_event_keys=[self.event_key],
         )
         self.assertEqual(resumed.task_id, "ADOS-POC-999")

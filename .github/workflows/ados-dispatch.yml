@@ -131,7 +131,8 @@ jobs:
       - name: Check out the trusted main manifest and validator
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: main
+          ref: ${{ github.sha }}
+          fetch-depth: 2
           persist-credentials: false
 
       - name: Validate manifest and durable issue ledger before claiming
@@ -150,8 +151,12 @@ jobs:
         run: |
           set -euo pipefail
           test "$ISSUE_AUTHOR" = "$EVENT_ACTOR" || { echo "REJECTED: event actor differs from issue author"; exit 1; }
+          trusted_revision_sha="$(git rev-parse HEAD)"
+          test "$trusted_revision_sha" = "$GITHUB_SHA" || { echo "REJECTED: checked-out trusted revision differs from triggering workflow SHA"; exit 1; }
           git fetch --no-tags origin main
-          base_sha="$(git rev-parse origin/main)"
+          current_main_sha="$(git rev-parse origin/main)"
+          test "$trusted_revision_sha" = "$current_main_sha" || { echo "REJECTED: main advanced after the dispatch event"; exit 1; }
+          manifest_parent_sha="$(git rev-parse HEAD^1)"
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" \
             | jq '[.[][] | {body: .body, user_login: .user.login}]' > "$RUNNER_TEMP/ados-comments-raw.json"
           python3 - "$RUNNER_TEMP/ados-comments-raw.json" "$RUNNER_TEMP/ados-ledger.json" <<'PYLEDGER'
@@ -177,7 +182,9 @@ jobs:
           PYLEDGER
           python3 scripts/ados_executor.py validate-dispatch \
             --issue "$ISSUE_NUMBER" --actor "$EVENT_ACTOR" \
-            --repository "$REPOSITORY" --base-sha "$base_sha" \
+            --repository "$REPOSITORY" --trusted-revision-sha "$trusted_revision_sha" \
+            --workflow-sha "$GITHUB_SHA" --current-main-sha "$current_main_sha" \
+            --manifest-parent-sha "$manifest_parent_sha" \
             --created-at "$ISSUE_CREATED_AT" --action "$EVENT_ACTION" \
             --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
             --comments-json "$RUNNER_TEMP/ados-ledger.json" > "$RUNNER_TEMP/ados-dispatch.json"

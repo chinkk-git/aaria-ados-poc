@@ -52,7 +52,17 @@ jobs:
               exact=[r for r in runs if r.get('event')=='issues' and r.get('display_title')==identity]
               linked=[p for p in prs if p.get('head',{}).get('ref')=='feature/ados-poc-002']
               age=(now-datetime.datetime.fromisoformat(issue['created_at'].replace('Z','+00:00'))).total_seconds()/60
-              if len(exact)>1:
+              body=issue.get('body') or ''
+              durable_quota='<!-- ADOS_TASK_STATE: BLOCKED_QUOTA -->' in body
+              durable_step=None
+              for line in body.splitlines():
+                  if line.startswith('<!-- ADOS_LAST_SUCCESSFUL_STEP: ') and line.endswith(' -->'):
+                      durable_step=line[len('<!-- ADOS_LAST_SUCCESSFUL_STEP: '):-len(' -->')]
+              # A durable issue checkpoint is stronger than a legacy display title.
+              # Do not infer a run ID from time proximity or silently retry the worker.
+              if durable_quota:
+                  status='BLOCKED_QUOTA'
+              elif len(exact)>1:
                   status='AMBIGUOUS_DUPLICATE_RUNS'
               elif len(exact)==1:
                   run=exact[0]
@@ -71,7 +81,7 @@ jobs:
                 'run_head_sha':exact[0].get('head_sha') if len(exact)==1 else None,
                 'branch_head_sha':branches['feature/ados-poc-002']['commit']['sha'],
                 'linked_prs':[p['number'] for p in linked],
-                'status':status,'observed_at':now.isoformat(),
+                'status':status,'last_successful_step':durable_step,'observed_at':now.isoformat(),
                 'next_action':'REVIEW_EVIDENCE_ONLY; no automatic retries or writes'}
               records.append(record)
               print(json.dumps(record,sort_keys=True))

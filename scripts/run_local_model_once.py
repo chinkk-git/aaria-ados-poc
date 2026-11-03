@@ -35,6 +35,34 @@ PROMPT = (
     "Do not use external files, libraries, network requests, cookies, or storage."
 )
 BASE_URL = "http://127.0.0.1:8090"
+MAX_PROMPT_BYTES = 12_000
+MAX_OUTPUT_BYTES = 100_000
+
+
+def load_prompt(prompt_path: Path | None = None) -> str:
+    """Load one bounded prompt; the historical synthetic prompt stays the default."""
+    if prompt_path is None:
+        return PROMPT
+    raw = prompt_path.read_bytes()
+    if not raw or len(raw) > MAX_PROMPT_BYTES:
+        raise RuntimeError("local_prompt_size_invalid")
+    try:
+        prompt = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("local_prompt_encoding_invalid") from exc
+    if not prompt.strip():
+        raise RuntimeError("local_prompt_empty")
+    return prompt
+
+
+def isolated_server_environment(*, home: Path, path: str = os.defpath) -> dict[str, str]:
+    """Give the model server only runtime variables, never inherited CI credentials."""
+    return {
+        "PATH": path,
+        "HOME": str(home),
+        "LANG": "C.UTF-8",
+        "CUDA_VISIBLE_DEVICES": "",
+    }
 
 
 def rss_kib(pid: int) -> int:
@@ -96,7 +124,9 @@ def request_json(url: str, data: bytes | None = None, timeout: float = 3.0) -> d
     return payload
 
 
-def run(model_path: Path, output_path: Path, evidence_path: Path) -> dict[str, object]:
+def run(model_path: Path, output_path: Path, evidence_path: Path,
+        prompt_path: Path | None = None) -> dict[str, object]:
+    prompt = load_prompt(prompt_path)
     verified = verify_model(model_path)
     binary = os.environ.get("LLAMA_SERVER_BIN", "")
     expected_commit = os.environ.get("LLAMA_CPP_EXPECTED_COMMIT", "")
@@ -108,9 +138,10 @@ def run(model_path: Path, output_path: Path, evidence_path: Path) -> dict[str, o
     ]
     log_path = evidence_path.parent / "llama-server.log"
     started = time.monotonic()
+    server_environment = isolated_server_environment(home=Path.home())
     process = subprocess.Popen(
         command, stdout=log_path.open("wb"), stderr=subprocess.STDOUT,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        env=server_environment,
         start_new_session=True,
     )
     peak_rss_kib = [0]
@@ -150,7 +181,7 @@ def run(model_path: Path, output_path: Path, evidence_path: Path) -> dict[str, o
 
         body = json.dumps({
             "model": MODEL_REPO,
-            "messages": [{"role": "user", "content": PROMPT}],
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
             "max_tokens": 600,
             "stream": False,
@@ -169,7 +200,7 @@ def run(model_path: Path, output_path: Path, evidence_path: Path) -> dict[str, o
             html = payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError("local_generation_response_shape") from exc
-        if not isinstance(html, str) or not html.strip() or len(html.encode("utf-8")) > 100_000:
+        if not isinstance(html, str) or not html.strip() or len(html.encode("utf-8")) > MAX_OUTPUT_BYTES:
             raise RuntimeError("local_generation_output_invalid")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(html, encoding="utf-8")
@@ -212,7 +243,10 @@ def run(model_path: Path, output_path: Path, evidence_path: Path) -> dict[str, o
 
 if __name__ == "__main__":
     try:
-        report = run(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
+        prompt_file = Path(sys.argv[4]) if len(sys.argv) > 4 else None
+        if len(sys.argv) > 5:
+            raise RuntimeError("local_model_argument_count_invalid")
+        report = run(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), prompt_file)
         print(json.dumps(report, sort_keys=True))
     except Exception as error:
         if len(sys.argv) > 3:
@@ -232,4 +266,5 @@ if __name__ == "__main__":
             }, sort_keys=True) + "\n", encoding="utf-8")
         print("LOCAL_MODEL_RUN: BLOCKED; code=" + str(error))
         raise SystemExit(1)
+
 

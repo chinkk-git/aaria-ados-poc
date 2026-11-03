@@ -1,127 +1,605 @@
-name: ADOS task dispatch
+name: ADOS manifest-driven task dispatch
+run-name: ADOS manifest dispatch
 
 on:
   issues:
     types: [opened]
+  schedule:
+    - cron: "*/5 * * * *"
 
-permissions:
-  contents: read
-
-concurrency:
-  group: ados-poc-001-exclusive-write-lease
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
-  dispatch-ados-poc-001:
-    if: >-
-      github.actor == 'chinkk-git' &&
-      github.event.issue.user.login == 'chinkk-git' &&
-      github.event.issue.title == '[ADOS-POC-001] Simple Practice Timer'
+  candidate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      issue_number: ${{ steps.select.outputs.issue_number }}
+      issue_author: ${{ steps.select.outputs.issue_author }}
+      created_at: ${{ steps.select.outputs.created_at }}
+      action: ${{ steps.select.outputs.action }}
+    steps:
+      - name: Check out trusted manifests from main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Select an opened or durably unclaimed authorized issue
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          EVENT_ACTOR: ${{ github.actor }}
+          EVENT_PATH: ${{ github.event_path }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYSELECT'
+          import glob, json, os, pathlib, re, subprocess, urllib.parse
+          repo = os.environ["REPOSITORY"]
+          status = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
+          try:
+              import datetime, time
+              status_age = time.time() - datetime.datetime.fromisoformat(status["last_verified_at"].replace("Z", "+00:00")).timestamp()
+          except Exception:
+              status_age = float("inf")
+          provider_ready = (status.get("model") == "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
+              and status.get("eligibility") == "VERIFIED_ZERO_COST"
+              and status.get("quota_status") == "NOT_APPLICABLE"
+              and status.get("cost_authorized_usd") == 0.0
+              and 0 <= status_age <= 3600)
+          if not provider_ready:
+              issues = []
+          elif os.environ["EVENT_NAME"] == "issues":
+              event = json.loads(pathlib.Path(os.environ["EVENT_PATH"]).read_text())
+              issues = [event["issue"]] if event.get("action") == "opened" else []
+          else:
+              pages = json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp",
+                  f"repos/{repo}/issues?state=open&per_page=100"]))
+              issues = [item for page in pages for item in page if "pull_request" not in item]
+          from scripts.ados_executor import select_reconciliation_candidate
+          manifests = {}
+          claimed = set()
+          leased = set()
+          for issue in issues:
+              number = int(issue["number"])
+              manifest_path = pathlib.Path("tasks/issues") / f"{number}.json"
+              if not manifest_path.is_file():
+                  continue
+              manifest = json.loads(manifest_path.read_text())
+              manifests[number] = manifest
+              comments = json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp",
+                  f"repos/{repo}/issues/{number}/comments"]))
+              bodies = [c.get("body", "") for page in comments for c in page]
+              own_claim = False
+              if os.environ["RUN_ATTEMPT"] != "1":
+                  for body in bodies:
+                      match = re.fullmatch(
+                          r"<!-- ADOS_DISPATCH_CLAIM task=(ADOS-POC-[0-9]{3}) event=[0-9a-f]{64} run=([0-9]+) -->",
+                          body)
+                      if match and match.group(1) == manifest.get("task_id") and match.group(2) == os.environ["RUN_ID"]:
+                          own_claim = True
+                          break
+              if any("<!-- ADOS_DISPATCH_" in body for body in bodies) and not own_claim:
+                  claimed.add(number)
+              ref = "heads/" + urllib.parse.quote(manifest.get("branch", ""), safe="")
+              probe = subprocess.run(["gh", "api", f"repos/{repo}/git/ref/{ref}"],
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              if probe.returncode == 0 and not own_claim:
+                  leased.add(manifest.get("branch", ""))
+          event_number = int(os.environ["ISSUE_NUMBER"]) if os.environ["EVENT_NAME"] == "issues" else None
+          selected = select_reconciliation_candidate(
+              issues, manifests, claimed_issue_numbers=claimed, leased_branches=leased,
+              event_issue_number=event_number,
+              event_actor=os.environ["EVENT_ACTOR"] if os.environ["EVENT_NAME"] == "issues" else None)
+          if selected is None:
+              chosen = {"issue_number": "", "issue_author": "", "created_at": "", "action": ""}
+          else:
+              chosen = {"issue_number": selected["issue_number"], "issue_author": selected["issue_author"],
+                        "created_at": selected["created_at"],
+                        "action": "opened" if os.environ["EVENT_NAME"] == "issues" else "reconcile"}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for key, value in chosen.items():
+                  output.write(f"{key}={value}\n")
+          PYSELECT
+
+  authorize:
+    needs: candidate
+    if: needs.candidate.outputs.issue_number != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: ados-dispatch-authorization-${{ needs.candidate.outputs.issue_number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+      actions: read
+    outputs:
+      task_id: ${{ steps.preflight.outputs.task_id }}
+      branch: ${{ steps.preflight.outputs.branch }}
+      expected_base_sha: ${{ steps.preflight.outputs.expected_base_sha }}
+      event_key: ${{ steps.preflight.outputs.event_key }}
+      resume: ${{ steps.preflight.outputs.resume }}
+    steps:
+      - name: Check out the trusted main manifest and validator
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Validate manifest and durable issue ledger before claiming
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
+          ISSUE_AUTHOR: ${{ needs.candidate.outputs.issue_author }}
+          EVENT_ACTOR: ${{ needs.candidate.outputs.issue_author }}
+          ISSUE_CREATED_AT: ${{ needs.candidate.outputs.created_at }}
+          EVENT_ACTION: ${{ needs.candidate.outputs.action }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$ISSUE_AUTHOR" = "$EVENT_ACTOR" || { echo "REJECTED: event actor differs from issue author"; exit 1; }
+          trusted_revision_sha="$(git rev-parse HEAD)"
+          test "$trusted_revision_sha" = "$GITHUB_SHA" || { echo "REJECTED: checked-out trusted revision differs from triggering workflow SHA"; exit 1; }
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          current_main_sha="$(git rev-parse origin/main)"
+          test "$trusted_revision_sha" = "$current_main_sha" || { echo "REJECTED: main advanced after the dispatch event"; exit 1; }
+          manifest_parent_sha="$(git rev-parse HEAD^1)"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" \
+            | jq '[.[][] | {body: .body, user_login: .user.login}]' > "$RUNNER_TEMP/ados-comments-raw.json"
+          python3 - "$RUNNER_TEMP/ados-comments-raw.json" "$RUNNER_TEMP/ados-ledger.json" <<'PYLEDGER'
+          import json, os, pathlib, re, subprocess, sys
+          raw = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          runs = {}
+          marker = re.compile(r"<!-- ADOS_DISPATCH_(?:CLAIM|CONSUMED|PROVIDER_STARTED) task=ADOS-POC-[0-9]{3} event=[0-9a-f]{64} run=([0-9]+) -->")
+          for comment in raw:
+              body = comment.get("body", "")
+              if "<!-- ADOS_DISPATCH_" in body:
+                  found = list(marker.finditer(body))
+                  if len(found) != 1 or body.strip() != found[0].group(0):
+                      raise SystemExit("REJECTED: malformed durable ledger marker")
+                  run_id = found[0].group(1)
+                  if run_id not in runs:
+                      payload = json.loads(subprocess.check_output([
+                          "gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}"
+                      ]))
+                      runs[run_id] = {"id": payload.get("id"), "repository": os.environ["GITHUB_REPOSITORY"],
+                                      "workflow_path": payload.get("path"), "event": payload.get("event"),
+                                      "head_branch": payload.get("head_branch"), "head_sha": payload.get("head_sha")}
+          pathlib.Path(sys.argv[2]).write_text(json.dumps({"comments": raw, "runs": runs}))
+          PYLEDGER
+          python3 scripts/ados_executor.py validate-dispatch \
+            --issue "$ISSUE_NUMBER" --actor "$EVENT_ACTOR" \
+            --repository "$REPOSITORY" --trusted-revision-sha "$trusted_revision_sha" \
+            --workflow-sha "$GITHUB_SHA" --current-main-sha "$current_main_sha" \
+            --manifest-parent-sha "$manifest_parent_sha" \
+            --created-at "$ISSUE_CREATED_AT" --action "$EVENT_ACTION" \
+            --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
+            --comments-json "$RUNNER_TEMP/ados-ledger.json" > "$RUNNER_TEMP/ados-dispatch.json"
+          python3 - "$RUNNER_TEMP/ados-dispatch.json" "$GITHUB_OUTPUT" <<'PY'
+          import json, pathlib, sys
+          data = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              for key in ("task_id", "branch", "expected_base_sha", "event_key", "resume", "provider_started"):
+                  value = str(data[key]).lower() if isinstance(data[key], bool) else str(data[key])
+                  output.write(f"{key}={value}\n")
+          PY
+      - name: Persist task claim before acquiring its branch lease
+        id: claim
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
+          TASK_ID: ${{ steps.preflight.outputs.task_id }}
+          EVENT_KEY: ${{ steps.preflight.outputs.event_key }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RESUME: ${{ steps.preflight.outputs.resume }}
+          PROVIDER_STARTED: ${{ steps.preflight.outputs.provider_started }}
+          BRANCH: ${{ steps.preflight.outputs.branch }}
+          EXPECTED_BASE_SHA: ${{ steps.preflight.outputs.expected_base_sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCLAIM'
+          import json, os, pathlib, subprocess, sys, urllib.parse, time
+          sys.path.insert(0, "scripts")
+          from ados_executor import (claim_then_acquire_dispatch_branch_lease,
+                                     parse_dispatch_manifest, validate_local_qwen_record)
+          issue = os.environ["ISSUE_NUMBER"]
+          repo = os.environ["REPOSITORY"]
+          branch = os.environ["BRANCH"]
+          task = json.loads(pathlib.Path(f"tasks/issues/{issue}.json").read_text())
+          manifest = parse_dispatch_manifest(task)
+          provider = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
+
+          def gh(args):
+              return subprocess.run(["gh", *args], text=True, capture_output=True)
+
+          def read_branch_sha():
+              ref = "heads/" + urllib.parse.quote(branch, safe="")
+              result = gh(["api", f"repos/{repo}/git/ref/{ref}"])
+              if result.returncode:
+                  if "HTTP 404" in result.stderr or "HTTP 404" in result.stdout:
+                      return None
+                  raise RuntimeError("dispatch_branch_read_failed")
+              return json.loads(result.stdout)["object"]["sha"]
+
+          def write_claim():
+              marker = f"<!-- ADOS_DISPATCH_CLAIM task={manifest.task_id} event={os.environ['EVENT_KEY']} run={os.environ['RUN_ID']} -->"
+              result = gh(["api", f"repos/{repo}/issues/{issue}/comments", "-f", f"body={marker}"])
+              if result.returncode:
+                  raise RuntimeError("dispatch_claim_write_failed")
+
+          def create_branch(sha):
+              result = gh(["api", f"repos/{repo}/git/refs", "-f", f"ref=refs/heads/{branch}", "-f", f"sha={sha}"])
+              if result.returncode:
+                  raise RuntimeError("dispatch_branch_lease_create_failed")
+
+          action = claim_then_acquire_dispatch_branch_lease(
+              expected_base_sha=os.environ["EXPECTED_BASE_SHA"],
+              same_run_claim=os.environ["RESUME"] == "true",
+              read_branch_sha=read_branch_sha,
+              validate_provider=lambda: validate_local_qwen_record(provider, manifest, now_epoch=time.time()),
+              write_claim=write_claim,
+              create_branch=create_branch,
+          )
+          if os.environ["PROVIDER_STARTED"] != "true":
+              marker = f"<!-- ADOS_DISPATCH_PROVIDER_STARTED task={manifest.task_id} event={os.environ['EVENT_KEY']} run={os.environ['RUN_ID']} -->"
+              result = gh(["api", f"repos/{repo}/issues/{issue}/comments", "-f", f"body={marker}"])
+              if result.returncode:
+                  raise RuntimeError("dispatch_provider_start_marker_failed")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"lease_action={action}\n")
+          print(f"CLAIM_AND_LEASE={action} task={manifest.task_id}")
+          PYCLAIM
+
+  execute:
+    needs: [candidate, authorize]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    concurrency:
+      group: ados-dispatch-branch-${{ needs.authorize.outputs.branch }}
+      cancel-in-progress: false
+    permissions: {}
+    steps:
+      - name: Check out the exact authorized base without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.authorize.outputs.expected_base_sha }}
+          persist-credentials: false
+
+      - name: Recover the prior attempt's output artifact without repeating inference
+        if: github.run_attempt > 1
+        id: recover_artifact
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ados-dispatch-${{ needs.authorize.outputs.event_key }}
+
+      - name: Fail closed when the prior worker artifact is missing
+        if: github.run_attempt > 1 && steps.recover_artifact.outcome != 'success'
+        run: |
+          echo "Recovery state: BLOCKED_MISSING_WORKER_ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Replay prevented::Prior worker artifact is missing; inference will not be repeated."
+          exit 1
+
+      - name: Revalidate local Qwen task and prepare one-file prompt
+        if: github.run_attempt == 1
+        env:
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          sys.path.insert(0, "scripts")
+          from ados_executor import (build_local_qwen_prompt, parse_dispatch_manifest,
+                                     validate_local_qwen_record)
+          manifest = parse_dispatch_manifest(json.loads(
+              pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text()))
+          provider = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
+          validate_local_qwen_record(provider, manifest)
+          if len(manifest.permitted_paths) != 1:
+              raise SystemExit("BLOCKED: local Qwen dispatcher currently accepts one-file tasks only")
+          target_path = manifest.permitted_paths[0]
+          source = pathlib.Path(target_path)
+          if source.is_symlink():
+              raise SystemExit("REJECTED: authorized base contains a symlink at the target path")
+          existing = source.read_text(encoding="utf-8") if source.exists() else ""
+          prompt = build_local_qwen_prompt(task_prompt=manifest.task_prompt,
+              acceptance_criteria=manifest.acceptance_criteria,
+              target_path=target_path, existing_content=existing)
+          prompt_file = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ados-qwen-prompt.txt"
+          prompt_file.write_text(prompt, encoding="utf-8")
+          PY
+
+      - name: Build the pinned local llama.cpp runtime
+        if: github.run_attempt == 1
+        env:
+          LLAMA_CPP_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/llama.cpp"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C "$source_dir" fetch --depth 1 origin "$LLAMA_CPP_COMMIT"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$LLAMA_CPP_COMMIT"
+          test -s "$source_dir/LICENSE"
+          grep -Fq "MIT License" "$source_dir/LICENSE"
+          cmake -S "$source_dir" -B "$source_dir/build" \
+            -DGGML_CUDA=OFF -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+          cmake --build "$source_dir/build" --target llama-server -j 4
+          test -x "$source_dir/build/bin/llama-server"
+
+      - name: Verify runner capacity and pinned model metadata
+        if: github.run_attempt == 1
+        run: python3 scripts/local_model_preflight.py "$RUNNER_TEMP/qwen-preflight.json"
+
+      - name: Download the checksum-pinned Qwen model once
+        if: github.run_attempt == 1
+        run: python3 scripts/download_local_model.py "$RUNNER_TEMP/qwen-coder.gguf" "$RUNNER_TEMP/qwen-download.json"
+
+      - name: Resolve bounded output paths from the manifest
+        id: qwenpaths
+        if: github.run_attempt == 1
+        env:
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          sys.path.insert(0, "scripts")
+          from ados_executor import parse_dispatch_manifest
+          manifest = parse_dispatch_manifest(json.loads(
+              pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text()))
+          target = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ados-candidate" / manifest.permitted_paths[0]
+          target.parent.mkdir(parents=True, exist_ok=True)
+          evidence = pathlib.Path(os.environ["RUNNER_TEMP"]) / "qwen-inference.json"
+          prompt = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ados-qwen-prompt.txt"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"output_path={target}\n")
+              output.write(f"evidence_path={evidence}\n")
+              output.write(f"prompt_path={prompt}\n")
+          PY
+
+      - name: Revalidate local Qwen eligibility immediately before inference
+        if: github.run_attempt == 1
+        env:
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYELIGIBILITY'
+          import json, os, pathlib, sys, time
+          sys.path.insert(0, "scripts")
+          from ados_executor import parse_dispatch_manifest, validate_local_qwen_record
+          manifest = parse_dispatch_manifest(json.loads(
+              pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text()))
+          provider = json.loads(pathlib.Path("providers/status.json").read_text())["local"]
+          validate_local_qwen_record(provider, manifest, now_epoch=time.time())
+          PYELIGIBILITY
+
+      - name: Make exactly one isolated local Qwen request
+        if: github.run_attempt == 1
+        env:
+          LLAMA_SERVER_BIN: ${{ runner.temp }}/llama.cpp/build/bin/llama-server
+          LLAMA_CPP_EXPECTED_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
+          OUTPUT_PATH: ${{ steps.qwenpaths.outputs.output_path }}
+          EVIDENCE_PATH: ${{ steps.qwenpaths.outputs.evidence_path }}
+          PROMPT_PATH: ${{ steps.qwenpaths.outputs.prompt_path }}
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=15s 16m python3 scripts/run_local_model_once.py \
+            "$RUNNER_TEMP/qwen-coder.gguf" "$OUTPUT_PATH" "$EVIDENCE_PATH" "$PROMPT_PATH"
+
+      - name: Validate one-file output and package only the permitted path
+        if: github.run_attempt == 1
+        env:
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, sys, zipfile
+          sys.path.insert(0, "scripts")
+          from ados_executor import parse_dispatch_manifest, validate_local_qwen_output
+          manifest = parse_dispatch_manifest(json.loads(
+              pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text()))
+          if len(manifest.permitted_paths) != 1:
+              raise SystemExit("REJECTED: expected a one-file task manifest")
+          target_path = manifest.permitted_paths[0]
+          generated = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ados-candidate" / target_path
+          if generated.is_symlink() or not generated.is_file():
+              raise SystemExit("REJECTED: generated output is missing or not a regular file")
+          contents = generated.read_text(encoding="utf-8")
+          validated = validate_local_qwen_output(returned_path=target_path,
+              expected_path=manifest.permitted_paths[0], content=contents)
+          archive_path = pathlib.Path("dispatch-output.zip")
+          with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              archive.writestr(target_path, validated)
+          PY
+
+      - name: Transfer validated output to the scoped writer job
+        if: github.run_attempt == 1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ados-dispatch-${{ needs.authorize.outputs.event_key }}
+          path: dispatch-output.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [candidate, authorize, execute]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ados-dispatch-branch-${{ needs.authorize.outputs.branch }}
+      cancel-in-progress: false
     permissions:
       contents: write
       pull-requests: write
+      issues: write
+      actions: read
     steps:
-      - name: Check out the single assigned task branch
+      - name: Check out the exact authorized base without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: feature/ados-control-plane-poc
+          ref: ${{ needs.authorize.outputs.expected_base_sha }}
           persist-credentials: false
 
-      - name: Enforce idempotency and existing branch lease
+      - name: Download the worker output artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ados-dispatch-${{ needs.authorize.outputs.event_key }}
+
+      - name: Revalidate the claim, current base, branch lease, and output scope
         env:
           GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.candidate.outputs.issue_number }}
+          TASK_ID: ${{ needs.authorize.outputs.task_id }}
+          BRANCH: ${{ needs.authorize.outputs.branch }}
+          EXPECTED_BASE_SHA: ${{ needs.authorize.outputs.expected_base_sha }}
+          EVENT_KEY: ${{ needs.authorize.outputs.event_key }}
+          RUN_ID: ${{ github.run_id }}
         shell: bash
         run: |
           set -euo pipefail
-          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-control-plane-poc" --state all --json number --jq 'length')"
-          if [[ "$existing" != "0" ]]; then
-            echo "REJECTED: task branch already has a PR; duplicate dispatch blocked."
-            exit 1
+          git fetch --no-tags origin main
+          test "$(git rev-parse origin/main)" = "$EXPECTED_BASE_SHA" || { echo "REJECTED: main advanced after authorization"; exit 1; }
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" \
+            | jq '[.[][] | {body: .body, user_login: .user.login}]' > "$RUNNER_TEMP/ados-comments.json"
+          python3 - <<'PYLEDGER'
+          import json, os, pathlib, re, subprocess
+          from scripts.ados_executor import dispatch_ledger
+          comments = json.loads(pathlib.Path(os.environ["RUNNER_TEMP"] + "/ados-comments.json").read_text())
+          runs = {}
+          marker = re.compile(r"<!-- ADOS_DISPATCH_(?:CLAIM|CONSUMED|PROVIDER_STARTED) task=ADOS-POC-[0-9]{3} event=[0-9a-f]{64} run=([0-9]+) -->")
+          for comment in comments:
+              body = comment.get("body", "")
+              if "<!-- ADOS_DISPATCH_" not in body:
+                  continue
+              found = list(marker.finditer(body))
+              if len(found) != 1 or body.strip() != found[0].group(0):
+                  raise SystemExit("REJECTED: malformed durable ledger marker")
+              run_id = found[0].group(1)
+              if run_id not in runs:
+                  payload = json.loads(subprocess.check_output(["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}"]))
+                  runs[run_id] = {"id": payload.get("id"), "repository": os.environ["GITHUB_REPOSITORY"],
+                                  "workflow_path": payload.get("path"), "event": payload.get("event"),
+                                  "head_branch": payload.get("head_branch"), "head_sha": payload.get("head_sha")}
+          events, consumed, claims, started = dispatch_ledger(comments, runs,
+              repository=os.environ["GITHUB_REPOSITORY"], expected_base_sha=os.environ["EXPECTED_BASE_SHA"])
+          if claims.get(os.environ["EVENT_KEY"]) != os.environ["RUN_ID"] or os.environ["EVENT_KEY"] not in started:
+              raise SystemExit("REJECTED: authenticated claim/provider-start marker is missing")
+          if os.environ["TASK_ID"] in consumed:
+              raise SystemExit("REJECTED: durable task claim is already consumed")
+          PYLEDGER
+          remote_sha="$(git ls-remote --heads origin "$BRANCH" | cut -f1)"
+          checkpointed=false
+          if [[ -n "$remote_sha" && "$remote_sha" != "$EXPECTED_BASE_SHA" ]]; then
+            git fetch --no-tags origin "$BRANCH"
+            git switch -c "$BRANCH" FETCH_HEAD
+            test "$(git rev-parse HEAD^)" = "$EXPECTED_BASE_SHA" || { echo "REJECTED: checkpoint parent is not the expected base"; exit 1; }
+            test "$(git rev-list --count "$EXPECTED_BASE_SHA..HEAD")" = "1" || { echo "REJECTED: branch contains an unexpected number of checkpoints"; exit 1; }
+            git log -1 --format=%B | grep -Fq "ADOS_DISPATCH_EVENT=$EVENT_KEY" || { echo "REJECTED: branch checkpoint belongs to another dispatch"; exit 1; }
+            checkpointed=true
+          else
+            git switch -c "$BRANCH"
           fi
-          if [[ -z "$(git ls-remote --heads origin feature/ados-control-plane-poc)" ]]; then
-            echo "REJECTED: assigned branch lease is missing."
-            exit 1
+          export ADOS_CHECKPOINTED="$checkpointed"
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, zipfile
+          from scripts.ados_executor import normalize_scope_path
+          manifest = json.loads(pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text())
+          with zipfile.ZipFile("dispatch-output.zip") as archive:
+              names = archive.namelist()
+              if os.environ.get("ADOS_CHECKPOINTED") == "true":
+                  parents = subprocess.check_output(["git", "show", "-s", "--format=%P", "HEAD"], text=True).strip().split()
+                  if parents != [os.environ["EXPECTED_BASE_SHA"]]:
+                      raise SystemExit("REJECTED: recovered checkpoint parent mismatch")
+                  raw_diff = subprocess.check_output(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD"])
+                  diff_paths = sorted(p for p in raw_diff.decode().split("\0") if p)
+                  artifact_paths = sorted(names)
+                  if not diff_paths or diff_paths != artifact_paths:
+                      raise SystemExit("REJECTED: recovered artifact paths differ from complete commit diff")
+                  tree = subprocess.check_output(["git", "ls-tree", "-r", "--format=%(mode) %(path)", "HEAD"], text=True)
+                  for row in tree.splitlines():
+                      mode, path = row.split(" ", 1)
+                      if path in diff_paths and mode not in {"100644", "100755"}:
+                          raise SystemExit("REJECTED: checkpoint contains a symlink or gitlink")
+              if not names or len(names) != len(set(names)):
+                  raise SystemExit("REJECTED: output archive is empty or has duplicate members")
+              for name in names:
+                  path = normalize_scope_path(name)
+                  if path not in manifest["permitted_paths"]:
+                      raise SystemExit("REJECTED: artifact contains an out-of-scope path")
+                  destination = pathlib.Path(path)
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  data = archive.read(name)
+                  if not data:
+                      raise SystemExit("REJECTED: output file is empty")
+                  if os.environ.get("ADOS_CHECKPOINTED") == "true":
+                      committed = subprocess.check_output(["git", "show", f"HEAD:{path}"])
+                      if committed != data:
+                          raise SystemExit("REJECTED: recovered artifact differs from committed checkpoint")
+                  else:
+                      destination.write_bytes(data)
+          PY
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          from scripts.ados_executor import normalize_scope_path
+          if os.environ["ADOS_CHECKPOINTED"] == "true":
+              raise SystemExit(0)
+          manifest = json.loads(pathlib.Path(f"tasks/issues/{os.environ['ISSUE_NUMBER']}.json").read_text())
+          allowed = set(manifest["permitted_paths"])
+          raw = subprocess.check_output(["git", "status", "--porcelain", "-z"])
+          changed = []
+          for entry in raw.decode().split("\0"):
+              if not entry:
+                  continue
+              status, path = entry[:2], normalize_scope_path(entry[3:])
+              if status.strip() not in {"??", "M", "A"} or path not in allowed:
+                  raise SystemExit("REJECTED: unexpected task changes before commit")
+              changed.append(path)
+          if not changed:
+              raise SystemExit("REJECTED: no output to commit")
+          subprocess.run(["git", "add", "--", *sorted(set(changed))], check=True)
+          PY
+          git diff --cached --check
+          if [[ "$checkpointed" != "true" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "feat: implement $TASK_ID from trusted manifest" -m "ADOS_DISPATCH_EVENT=$EVENT_KEY"
+            gh auth setup-git
+            git push origin "HEAD:$BRANCH"
           fi
-          echo "LEASE: one dispatch owns feature/ados-control-plane-poc."
-
-      - name: Install pinned OpenCode CLI
-        run: |
-          set -euo pipefail
-          npm install --global @opencode/cli@2.2.5
-          opencode --version
-
-      - name: Configure strict task write scope
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > opencode.json <<'JSON'
-          {
-            "$schema": "https://opencode.ai/config.json",
-            "permission": {
-              "*": "deny",
-              "read": {
-                "*": "allow",
-                "*.env": "deny",
-                "*.env.*": "deny"
-              },
-              "glob": "allow",
-              "grep": "allow",
-              "edit": {
-                "*": "deny",
-                "index.html": "allow"
-              },
-              "external_directory": "deny",
-              "bash": "deny",
-              "task": "deny",
-              "webfetch": "deny",
-              "websearch": "deny",
-              "lsp": "deny",
-              "todowrite": "deny"
-            }
-          }
-          JSON
-
-      - name: Run the authenticated coding executor
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          trap 'rm -f opencode.json' EXIT
-          opencode run --standalone --auto \
-            --model openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free \
-            "Implement ADOS-POC-001 in this repository. Create only index.html: a small accessible static practice timer with a visible 15-minute countdown, Start, Pause, and Reset. Start begins the countdown and resumes after Pause; Reset restores 15:00 and stops it. No authentication, personal data, external resources, frameworks, or production integration. Keep implementation focused and self-contained."
-
-      - name: Reject out-of-scope edits and empty output
-        shell: bash
-        run: |
-          set -euo pipefail
-          changed="$(git status --porcelain | sed 's/^...//')"
-          if [[ "$changed" != "index.html" || ! -s index.html ]]; then
-            echo "REJECTED: executor output must contain only a nonempty index.html."
-            git status --short
-            exit 1
+          existing_prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:$BRANCH" --state all --json number,state,body,headRefOid)"
+          existing_count="$(jq 'length' <<<"$existing_prs")"
+          if [[ "$existing_count" == "0" ]]; then
+            gh auth setup-git
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+              --draft --title "[$TASK_ID] Manifest-driven task result" \
+              --body "Automated result for task issue #$ISSUE_NUMBER. Authorized by the trusted main-branch manifest and durable claim $EVENT_KEY. Worker credentials were isolated from GitHub write credentials. Exact-head focused CI and independent review are next; this PR is not merged."
+          else
+            echo "$existing_prs" | jq -e --arg event "$EVENT_KEY" --arg head "$(git rev-parse HEAD)" \
+              'length == 1 and .[0].state == "OPEN" and .[0].headRefOid == $head and (.[0].body | contains($event))' >/dev/null \
+              || { echo "REJECTED: existing PR does not match this exact dispatch checkpoint"; exit 1; }
           fi
-          echo "VERIFIED: executor changed only index.html."
-
-      - name: Commit, push and open the task PR
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- index.html
-          git commit -m "feat: implement ADOS practice timer"
-          gh auth setup-git
-          git push origin HEAD:feature/ados-control-plane-poc
-          gh pr create \
-            --repo "$GITHUB_REPOSITORY" \
-            --base main \
-            --head feature/ados-control-plane-poc \
-            --title "[ADOS-POC-001] Simple Practice Timer" \
-            --body "Automated executor result for task issue #${ISSUE_NUMBER}. The OpenCode worker was invoked by the issue-opened workflow. Only index.html was in its write scope; focused verification and independent review are next."
+          consumed="<!-- ADOS_DISPATCH_CONSUMED task=$TASK_ID event=$EVENT_KEY run=$RUN_ID -->"
+          gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" -f body="$consumed" >/dev/null

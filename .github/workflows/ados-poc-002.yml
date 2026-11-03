@@ -1,100 +1,16 @@
-name: ADOS POC 002 isolated dispatch
-run-name: ADOS-POC-002 issue-${{ github.event.issue.number }}
+name: ADOS POC 002 historical route (retired)
+
+# Issue #9 completed through the single-use artifact handoff and merged as
+# a64c9e8caf37eef22ade5651734bdc9a5bd53ee7. Keep this file as an audit tombstone;
+# the old title-matched worker route is intentionally no longer triggerable.
 on:
-  issues:
-    types: [opened]
+  workflow_dispatch:
 
-permissions:
-  contents: read
-
-concurrency:
-  group: ados-poc-002-exclusive-write-lease
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
-  execute:
-    if: >-
-      github.actor == 'chinkk-git' &&
-      github.event.issue.user.login == 'chinkk-git' &&
-      github.event.issue.title == '[ADOS-POC-002] Daily Practice Complete'
+  retired:
+    if: ${{ false }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
-      issues: read
     steps:
-      - name: Checkout exclusive task branch
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: feature/ados-poc-002
-          persist-credentials: false
-      - name: Deterministic duplicate and scope preflight
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test ! -e daily-practice.html || { echo "REJECTED: output already exists"; exit 1; }
-          test -z "$(git status --porcelain)" || { echo "REJECTED: dirty branch"; exit 1; }
-          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REPOSITORY_OWNER:feature/ados-poc-002" --state all --json number --jq 'length')"
-          test "$existing" = "0" || { echo "REJECTED: existing PR"; exit 1; }
-          echo "VERIFIED: exclusive branch ready"
-      - name: Install pinned executor
-        run: |
-          set -euo pipefail
-          npm install --global @opencode/cli@2.2.5
-          opencode --version
-      - name: Configure executor permissions
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > opencode.json <<'JSON'
-          {
-            "$schema": "https://opencode.ai/config.json",
-            "permission": {
-              "*": "deny",
-              "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"},
-              "glob": "allow",
-              "grep": "allow",
-              "edit": {"*": "deny", "daily-practice.html": "allow"},
-              "external_directory": "deny",
-              "bash": "deny",
-              "task": "deny",
-              "webfetch": "deny",
-              "websearch": "deny",
-              "lsp": "deny",
-              "todowrite": "deny"
-            }
-          }
-          JSON
-      - name: Run OpenCode free-model worker
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          trap 'rm -f opencode.json' EXIT
-          test -n "$OPENROUTER_API_KEY" || { echo "BLOCKED: missing secret"; exit 1; }
-          opencode run --standalone --auto \
-            --model openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free \
-            "ADOS-POC-002. Create ONLY daily-practice.html: a self-contained accessible HTML page with a heading Daily Practice, a button Mark Complete, and a status indicator initially Not completed. Clicking the button changes status to Completed. Reload resets status to Not completed (no localStorage). Use no external dependencies, personal data, network calls, or other files. Do not edit index.html."
-      - name: Enforce single-file output
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git status --porcelain | sed 's/^...//')" = "daily-practice.html" || { echo "REJECTED: unexpected changes"; git status --short; exit 1; }
-          test -s daily-practice.html || { echo "REJECTED: empty output"; exit 1; }
-          echo "VERIFIED: only daily-practice.html changed"
-      - name: Preserve commit checkpoint
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- daily-practice.html
-          git commit -m "feat: implement ADOS POC 002 practice indicator"
-          gh auth setup-git
-          git push origin HEAD:feature/ados-poc-002
-          echo "VERIFIED: implementation pushed; PR handoff via authorized connector"
+      - run: 'echo "Retired: Issue #9 is complete and its claim is consumed."'

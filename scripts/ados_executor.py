@@ -252,7 +252,7 @@ def parse_control_tower_decision_budget(payload: object) -> ControlTowerDecision
 def control_tower_decision_id(*, task_id: str, blocker_sha256: str,
                               authorization_id: str) -> str:
     validate_task_id(task_id)
-    if not exact_sha256(blocker_sha256):
+    if not isinstance(blocker_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", blocker_sha256):
         raise ValueError("control_tower_blocker_digest_invalid")
     return hashlib.sha256(
         f"{task_id}\\0{blocker_sha256}\\0{authorization_id}".encode("utf-8")

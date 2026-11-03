@@ -901,6 +901,7 @@ class ControlTowerDecisionTests(unittest.TestCase):
             blocker_sha256=self.digest, budget=self.budget)
 
     def test_fake_qwen_decision_parses_and_authorizes_one_safe_resume(self):
+        digest, budget = self.digest, self.budget
         class FakeQwen:
             calls = 0
             def execute(self, _prompt):
@@ -908,9 +909,9 @@ class ControlTowerDecisionTests(unittest.TestCase):
                 return json.dumps({
                     "schema_version": 1,
                     "decision_id": ae.control_tower_decision_id(
-                        task_id="ADOS-POC-999", blocker_sha256=self.digest,
-                        authorization_id=self.budget.authorization_id),
-                    "task_id": "ADOS-POC-999", "blocker_sha256": self.digest,
+                        task_id="ADOS-POC-999", blocker_sha256=digest,
+                        authorization_id=budget.authorization_id),
+                    "task_id": "ADOS-POC-999", "blocker_sha256": digest,
                     "category": "ROUTINE_TECHNICAL", "decision": "RESUME_ONCE",
                     "rationale": "A pre-inference runner setup issue left the worker call unused.",
                     "recommended_action": "Resume once within the existing task scope.",

@@ -1,14 +1,20 @@
 {
   "issue_number": 999,
-  "authorized_actors": ["chinkk-git"],
+  "authorized_actors": [
+    "chinkk-git"
+  ],
   "repository": "chinkk-git/aaria-ados-poc",
   "task_id": "ADOS-POC-999",
   "branch": "experiment/ados-e01-synthetic",
   "expected_base_sha": "a64c9e8caf37eef22ade5651734bdc9a5bd53ee7",
-  "permitted_paths": ["daily-practice.html"],
+  "permitted_paths": [
+    "daily-practice.html"
+  ],
   "task_prompt": "Synthetic fixture only. No external model call, provider call, or repository write.",
-  "acceptance_criteria": ["The fake worker receives this manifest once."],
-  "cost_ceiling_usd": 0.0,
+  "acceptance_criteria": [
+    "The fake worker receives this manifest once."
+  ],
+  "cost_ceiling_usd": 0,
   "provider": "local",
   "provider_model": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
   "provider_model_revision": "f86cb2c1fa58255f8052cc32aeede1b7482d4361",
@@ -16,5 +22,6 @@
   "inference_authorization_id": null,
   "max_provider_calls": 1,
   "max_workflow_recoveries": 2,
-  "enabled": false
+  "enabled": false,
+  "control_tower_decision_budget": null
 }

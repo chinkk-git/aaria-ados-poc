@@ -153,7 +153,7 @@ jobs:
           test "$ISSUE_AUTHOR" = "$EVENT_ACTOR" || { echo "REJECTED: event actor differs from issue author"; exit 1; }
           trusted_revision_sha="$(git rev-parse HEAD)"
           test "$trusted_revision_sha" = "$GITHUB_SHA" || { echo "REJECTED: checked-out trusted revision differs from triggering workflow SHA"; exit 1; }
-          git fetch --no-tags origin main
+          git fetch --no-tags origin main:refs/remotes/origin/main
           current_main_sha="$(git rev-parse origin/main)"
           test "$trusted_revision_sha" = "$current_main_sha" || { echo "REJECTED: main advanced after the dispatch event"; exit 1; }
           manifest_parent_sha="$(git rev-parse HEAD^1)"

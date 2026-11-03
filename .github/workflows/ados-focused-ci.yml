@@ -28,7 +28,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  change-scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    outputs:
+      workflow_only: ${{ steps.scope.outputs.workflow_only }}
+    steps:
+      - name: Check out the exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Identify whether this commit only adds the isolated preflight
+        id: scope
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "${{ github.event.pull_request.head.sha }}"
+          mapfile -t changed < <(git diff --name-only "$actual^" "$actual")
+          if [[ "${#changed[@]}" -eq 1 && "${changed[0]}" == ".github/workflows/ados-focused-ci.yml" ]]; then
+            echo "workflow_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "workflow_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
   focused-tests:
+    needs: change-scope
+    if: ${{ !(github.event.pull_request.number == 25 &&
+      github.event.pull_request.head.ref == 'feature/ados-internal-blocker-handoff' &&
+      needs.change-scope.outputs.workflow_only == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -52,6 +83,124 @@ jobs:
           python3 -m json.tool schemas/task-manifest.schema.json >/dev/null
           python3 -m json.tool tasks/example-task.json >/dev/null
           python3 -m json.tool providers/status.json >/dev/null
+
+  qwen-noninference-preflight:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.number == 25 &&
+      github.event.pull_request.head.repo.full_name == 'chinkk-git/aaria-ados-poc' &&
+      github.event.pull_request.head.ref == 'feature/ados-internal-blocker-handoff'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact PR head without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Verify PR scope, trusted main and public standard runner
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          EXPECTED_MAIN_SHA: 6146541393be0da9713b7b38d5343e96f953fe2a
+        run: |
+          set -euo pipefail
+          test "$PR_NUMBER" = "25"
+          test "$HEAD_BRANCH" = "feature/ados-internal-blocker-handoff"
+          test "$HEAD_REPOSITORY" = "chinkk-git/aaria-ados-poc"
+          test "$REPOSITORY_VISIBILITY" = "public"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          main_sha="$(git ls-remote origin refs/heads/main | cut -f1)"
+          test "$main_sha" = "$EXPECTED_MAIN_SHA"
+          mkdir -p "$RUNNER_TEMP/ados-qwen-preflight"
+          printf '{"tested_sha":"%s","main_sha":"%s","runner":"ubuntu-24.04","repository_visibility":"%s","inference_requests":0,"provider_calls":0,"secrets_accessed":false}\n' \
+            "$EXPECTED_SHA" "$main_sha" "$REPOSITORY_VISIBILITY" \
+            > "$RUNNER_TEMP/ados-qwen-preflight/context.json"
+      - name: Verify current pinned model metadata and runner resources
+        run: python3 scripts/local_model_preflight.py "$RUNNER_TEMP/ados-qwen-preflight/preflight.json"
+      - name: Download and verify the pinned model file without inference
+        run: python3 scripts/download_local_model.py "$RUNNER_TEMP/qwen-coder.gguf" "$RUNNER_TEMP/ados-qwen-preflight/model.json"
+      - name: Build the pinned llama.cpp runtime without inference
+        env:
+          LLAMA_CPP_COMMIT: 3f8af15a76ac8675812e856da45454bafc90f12c
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/llama.cpp"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C "$source_dir" fetch --depth 1 origin "$LLAMA_CPP_COMMIT"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$LLAMA_CPP_COMMIT"
+          grep -Fq "MIT License" "$source_dir/LICENSE"
+          cmake -S "$source_dir" -B "$source_dir/build" -DGGML_CUDA=OFF -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+          cmake --build "$source_dir/build" --target llama-server -j 4
+          "$source_dir/build/bin/llama-server" --version
+      - name: Load model and verify local health only; never request completion
+        env:
+          MODEL_PATH: ${{ runner.temp }}/qwen-coder.gguf
+          SERVER_BIN: ${{ runner.temp }}/llama.cpp/build/bin/llama-server
+          SERVER_LOG: ${{ runner.temp }}/ados-qwen-preflight/server.log
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, signal, subprocess, time, urllib.error, urllib.request
+          command = [os.environ["SERVER_BIN"], "-m", os.environ["MODEL_PATH"],
+              "--host", "127.0.0.1", "--port", "8090", "--ctx-size", "4096",
+              "--threads", "4", "--n-gpu-layers", "0"]
+          env = {"PATH": os.defpath, "HOME": os.environ["RUNNER_TEMP"],
+              "LANG": "C.UTF-8", "CUDA_VISIBLE_DEVICES": ""}
+          with open(os.environ["SERVER_LOG"], "wb") as log:
+              process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                  env=env, start_new_session=True)
+          try:
+              deadline = time.monotonic() + 120
+              while time.monotonic() < deadline:
+                  if process.poll() is not None:
+                      raise SystemExit("PREFLIGHT_BLOCKED: pinned server exited before ready")
+                  try:
+                      with urllib.request.urlopen("http://127.0.0.1:8090/health", timeout=2) as response:
+                          if response.status == 200:
+                              print("QWEN_RUNTIME_HEALTH=PASS; inference_requests=0")
+                              break
+                  except (urllib.error.URLError, TimeoutError):
+                      time.sleep(0.25)
+              else:
+                  raise SystemExit("PREFLIGHT_BLOCKED: pinned server health timeout")
+          finally:
+              if process.poll() is None:
+                  os.killpg(process.pid, signal.SIGTERM)
+                  try:
+                      process.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(process.pid, signal.SIGKILL)
+                      process.wait(timeout=5)
+          PY
+      - name: Record durable non-inference eligibility evidence
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          root = pathlib.Path("${{ runner.temp }}/ados-qwen-preflight")
+          context = json.loads((root / "context.json").read_text())
+          preflight = json.loads((root / "preflight.json").read_text())
+          model = json.loads((root / "model.json").read_text())
+          evidence = {**context, **preflight, **model,
+              "llama_cpp_commit": "3f8af15a76ac8675812e856da45454bafc90f12c",
+              "runtime_build": "PASS", "runtime_health": "PASS",
+              "inference_requests": 0, "provider_calls": 0,
+              "provider_cost_ceiling_usd": 0.0,
+              "runner_cost_basis": "public repository standard ubuntu-24.04 runner",
+              "eligibility_update": "NOT_APPLIED; trusted main remains authoritative"}
+          serialized = json.dumps(evidence, sort_keys=True, indent=2)
+          print(serialized)
+          with open(pathlib.Path(__import__("os").environ["GITHUB_STEP_SUMMARY"]), "a") as summary:
+              summary.write("## Qwen non-inference preflight\n\n\x60\x60\x60json\n" + serialized + "\n\x60\x60\x60\n")
+          PY
 
   independent-review:
     if: github.event.pull_request.head.ref != 'feature/ados-e01-reusable-manifest-dispatch' && github.event.pull_request.head.ref != 'feature/ados-internal-blocker-handoff'

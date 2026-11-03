@@ -1,4 +1,6 @@
 import json
+import contextlib
+import io
 import subprocess
 import tempfile
 import unittest
@@ -859,6 +861,277 @@ class OrchestrationTests(unittest.TestCase):
         record = ae.TaskRecord(manifest())
         with self.assertRaises(ae.InvalidTransition):
             record.transition(ae.State.COMPLETE)
+
+
+class ControlTowerDecisionTests(unittest.TestCase):
+    def setUp(self):
+        self.budget = ae.parse_control_tower_decision_budget({
+            "authorization_id": "AUTH-SYNTHETIC-CT-001",
+            "max_calls": 1,
+            "max_resume_dispatches": 1,
+            "cost_ceiling_usd": 0.0,
+            "provider": "local",
+            "model": ae.LOCAL_QWEN_MODEL,
+            "model_revision": ae.LOCAL_QWEN_REVISION,
+            "model_sha256": ae.LOCAL_QWEN_SHA256,
+        })
+        self.blocker = {
+            "task_id": "ADOS-POC-999",
+            "failure_code": "RUNNER_SETUP_BEFORE_INFERENCE",
+            "provider_started": False,
+            "worker_provider_calls": 0,
+            "branch_at_expected_base": True,
+        }
+        self.serialized = json.dumps(self.blocker, sort_keys=True, separators=(",", ":"))
+        self.digest = ae.hashlib.sha256(self.serialized.encode()).hexdigest()
+
+    def decision(self, category="ROUTINE_TECHNICAL", action="RESUME_ONCE"):
+        payload = {
+            "schema_version": 1,
+            "decision_id": ae.control_tower_decision_id(
+                task_id="ADOS-POC-999", blocker_sha256=self.digest,
+                authorization_id=self.budget.authorization_id),
+            "task_id": "ADOS-POC-999",
+            "blocker_sha256": self.digest,
+            "category": category,
+            "decision": action,
+            "rationale": "Synthetic reasoning only; retry remains within the trusted task.",
+            "recommended_action": "Resume the one unused worker call.",
+        }
+        return ae.validate_control_tower_decision(
+            json.dumps(payload), task_id="ADOS-POC-999",
+            blocker_sha256=self.digest, budget=self.budget)
+
+    def test_fake_qwen_decision_parses_and_authorizes_one_safe_resume(self):
+        digest, budget = self.digest, self.budget
+        class FakeQwen:
+            calls = 0
+            def execute(self, _prompt):
+                self.calls += 1
+                return json.dumps({
+                    "schema_version": 1,
+                    "decision_id": ae.control_tower_decision_id(
+                        task_id="ADOS-POC-999", blocker_sha256=digest,
+                        authorization_id=budget.authorization_id),
+                    "task_id": "ADOS-POC-999", "blocker_sha256": digest,
+                    "category": "ROUTINE_TECHNICAL", "decision": "RESUME_ONCE",
+                    "rationale": "A pre-inference runner setup issue left the worker call unused.",
+                    "recommended_action": "Resume once within the existing task scope.",
+                })
+        fake = FakeQwen()
+        prompt = ae.build_control_tower_decision_prompt(
+            task_id="ADOS-POC-999", permitted_paths=["daily-practice.html"],
+            blocker_record=self.blocker, budget=self.budget)
+        decision = ae.validate_control_tower_decision(
+            fake.execute(prompt), task_id="ADOS-POC-999",
+            blocker_sha256=self.digest, budget=self.budget)
+        result = ae.authorize_builder_resume(
+            decision, task_id="ADOS-POC-999", blocker_sha256=self.digest,
+            budget=self.budget, trusted_guard_category="PRE_INFERENCE_TECHNICAL",
+            provider_started=False, worker_provider_calls=0, resume_dispatches=0,
+            branch_at_expected_base=True, claim_authenticated=True, task_unconsumed=True)
+        self.assertEqual(fake.calls, 1)
+        self.assertEqual(result, "RESUME_ONCE")
+        self.assertNotIn("GITHUB_TOKEN", prompt)
+        self.assertNotIn("run_local_model_once", prompt)
+
+    def test_qwen_decision_cannot_override_owner_gates_or_replay_controls(self):
+        unsafe_decision = self.decision(category="SECURITY")
+        self.assertEqual(ae.authorize_builder_resume(
+            unsafe_decision, task_id="ADOS-POC-999", blocker_sha256=self.digest,
+            budget=self.budget, trusted_guard_category="PRE_INFERENCE_TECHNICAL",
+            provider_started=False, worker_provider_calls=0, resume_dispatches=0,
+            branch_at_expected_base=True, claim_authenticated=True, task_unconsumed=True),
+            "OWNER_AUTHORIZATION_REQUIRED")
+        safe = self.decision()
+        cases = [
+            ({"provider_started": True}, "BLOCKED_PROVIDER_CALL_CONSUMED_OR_UNCERTAIN"),
+            ({"worker_provider_calls": 1}, "BLOCKED_PROVIDER_CALL_CONSUMED_OR_UNCERTAIN"),
+            ({"trusted_guard_category": "COST"}, "OWNER_AUTHORIZATION_REQUIRED"),
+            ({"resume_dispatches": 1}, "BLOCKED_RESUME_LIMIT"),
+            ({"branch_at_expected_base": False}, "BLOCKED_AUTHORIZATION_OR_LEASE"),
+            ({"claim_authenticated": False}, "BLOCKED_AUTHORIZATION_OR_LEASE"),
+            ({"task_unconsumed": False}, "BLOCKED_AUTHORIZATION_OR_LEASE"),
+        ]
+        base = dict(budget=self.budget, trusted_guard_category="PRE_INFERENCE_TECHNICAL",
+                    provider_started=False, worker_provider_calls=0, resume_dispatches=0,
+                    branch_at_expected_base=True, claim_authenticated=True, task_unconsumed=True)
+        for change, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(ae.authorize_builder_resume(
+                    safe, task_id="ADOS-POC-999", blocker_sha256=self.digest,
+                    **{**base, **change}), expected)
+
+    def test_decision_budget_is_separate_zero_cost_and_single_use(self):
+        with self.assertRaisesRegex(ValueError, "control_tower_budget_call_limit_invalid"):
+            ae.parse_control_tower_decision_budget({
+                "authorization_id": "AUTH-SYNTHETIC-CT-001", "max_calls": 2,
+                "max_resume_dispatches": 1, "cost_ceiling_usd": 0.0,
+                "provider": "local", "model": ae.LOCAL_QWEN_MODEL,
+                "model_revision": ae.LOCAL_QWEN_REVISION, "model_sha256": ae.LOCAL_QWEN_SHA256,
+            })
+        with self.assertRaisesRegex(ValueError, "control_tower_budget_cost_invalid"):
+            ae.parse_control_tower_decision_budget({
+                "authorization_id": "AUTH-SYNTHETIC-CT-001", "max_calls": 1,
+                "max_resume_dispatches": 1, "cost_ceiling_usd": 0.01,
+                "provider": "local", "model": ae.LOCAL_QWEN_MODEL,
+                "model_revision": ae.LOCAL_QWEN_REVISION, "model_sha256": ae.LOCAL_QWEN_SHA256,
+            })
+        self.assertIsNone(ae.parse_control_tower_decision_budget(None))
+        self.assertEqual(ae.authorize_builder_resume(
+            self.decision(), task_id="ADOS-POC-999", blocker_sha256=self.digest,
+            budget=None, trusted_guard_category="PRE_INFERENCE_TECHNICAL",
+            provider_started=False, worker_provider_calls=0, resume_dispatches=0,
+            branch_at_expected_base=True, claim_authenticated=True, task_unconsumed=True),
+            "BLOCKED_NO_DECISION_BUDGET")
+
+    def test_decision_output_binding_and_schema_are_strict(self):
+        valid = self.decision()
+        with self.assertRaisesRegex(ValueError, "control_tower_decision_binding_invalid"):
+            ae.validate_control_tower_decision(
+                json.dumps({**valid, "task_id": "ADOS-POC-001"}),
+                task_id="ADOS-POC-999", blocker_sha256=self.digest, budget=self.budget)
+        with self.assertRaisesRegex(ValueError, "control_tower_decision_fields_invalid"):
+            ae.validate_control_tower_decision(
+                json.dumps({**valid, "extra": "unsafe"}),
+                task_id="ADOS-POC-999", blocker_sha256=self.digest, budget=self.budget)
+
+    def test_decision_consumption_ledger_requires_bot_and_verified_workflow_run(self):
+        decision_id = ae.control_tower_decision_id(
+            task_id="ADOS-POC-999", blocker_sha256=self.digest,
+            authorization_id=self.budget.authorization_id)
+        marker = ae.control_tower_marker(
+            "CONSUMED", task_id="ADOS-POC-999", decision_id=decision_id,
+            blocker_sha256=self.digest,
+            authorization_id=self.budget.authorization_id,
+            source_run_id=700, workflow_run_id=800)
+        comments = [{"body": marker, "user_login": "github-actions[bot]"}]
+        runs = {"800": {
+            "id": 800, "repository": "chinkk-git/aaria-ados-poc",
+            "workflow_path": ".github/workflows/ados-control-tower.yml",
+            "event": "workflow_run", "head_branch": "main",
+            "head_sha": "a" * 40,
+        }}
+        ledger = ae.validate_control_tower_ledger(
+            comments, runs, repository="chinkk-git/aaria-ados-poc",
+            expected_main_sha="a" * 40, source_run_id=700,
+            task_id="ADOS-POC-999", authorization_id=self.budget.authorization_id)
+        self.assertEqual(ledger["CONSUMED"], {decision_id})
+        with self.assertRaisesRegex(ae.DuplicateExecution, "control_tower_budget_already_consumed"):
+            ae.assert_control_tower_budget_unconsumed(
+                comments, task_id="ADOS-POC-999",
+                authorization_id=self.budget.authorization_id)
+        other_digest = "c" * 64
+        other_decision = ae.control_tower_decision_id(
+            task_id="ADOS-POC-999", blocker_sha256=other_digest,
+            authorization_id=self.budget.authorization_id)
+        other_marker = ae.control_tower_marker(
+            "CONSUMED", task_id="ADOS-POC-999", decision_id=other_decision,
+            blocker_sha256=other_digest,
+            authorization_id=self.budget.authorization_id,
+            source_run_id=701, workflow_run_id=801)
+        with self.assertRaisesRegex(ae.DuplicateExecution, "control_tower_budget_already_consumed"):
+            ae.assert_control_tower_budget_unconsumed(
+                [{"body": other_marker}], task_id="ADOS-POC-999",
+                authorization_id=self.budget.authorization_id)
+        with self.assertRaisesRegex(ValueError, "control_tower_marker_forged"):
+            ae.validate_control_tower_ledger(
+                [{"body": marker, "user_login": "attacker"}], runs,
+                repository="chinkk-git/aaria-ados-poc", expected_main_sha="a" * 40,
+                source_run_id=700, task_id="ADOS-POC-999",
+                authorization_id=self.budget.authorization_id)
+        with self.assertRaisesRegex(ValueError, "control_tower_marker_run_unverified"):
+            ae.validate_control_tower_ledger(
+                comments, {"800": {**runs["800"], "head_sha": "b" * 40}},
+                repository="chinkk-git/aaria-ados-poc", expected_main_sha="a" * 40,
+                source_run_id=700, task_id="ADOS-POC-999",
+                authorization_id=self.budget.authorization_id)
+        with self.assertRaisesRegex(ValueError, "control_tower_marker_malformed"):
+            ae.validate_control_tower_ledger(
+                [{"body": marker + " forged", "user_login": "github-actions[bot]"}], runs,
+                repository="chinkk-git/aaria-ados-poc", expected_main_sha="a" * 40,
+                source_run_id=700, task_id="ADOS-POC-999",
+                authorization_id=self.budget.authorization_id)
+        with self.assertRaisesRegex(ValueError, "control_tower_marker_duplicate"):
+            ae.validate_control_tower_ledger(
+                comments * 2, runs, repository="chinkk-git/aaria-ados-poc",
+                expected_main_sha="a" * 40, source_run_id=700,
+                task_id="ADOS-POC-999", authorization_id=self.budget.authorization_id)
+
+    def test_authorized_resume_reclaims_only_its_existing_base_lease(self):
+        base = "a" * 40
+        state = {"branch": base, "claims": 0, "provider_checks": 0}
+        def validate_provider():
+            state["provider_checks"] += 1
+        def write_claim():
+            state["claims"] += 1
+        action = ae.claim_then_acquire_dispatch_branch_lease(
+            expected_base_sha=base, same_run_claim=False, authorized_resume=True,
+            read_branch_sha=lambda: state["branch"], validate_provider=validate_provider,
+            write_claim=write_claim, create_branch=lambda _sha: self.fail("must not recreate lease"))
+        self.assertEqual(action, "RECOVERED")
+        self.assertEqual(state, {"branch": base, "claims": 1, "provider_checks": 1})
+        state["branch"] = "b" * 40
+        with self.assertRaisesRegex(ae.DuplicateExecution, "dispatch_resume_branch_not_at_base"):
+            ae.claim_then_acquire_dispatch_branch_lease(
+                expected_base_sha=base, same_run_claim=False, authorized_resume=True,
+                read_branch_sha=lambda: state["branch"], validate_provider=validate_provider,
+                write_claim=write_claim, create_branch=lambda _sha: None)
+
+    def test_dispatch_cli_accepts_verified_resume_once_then_rejects_replay(self):
+        dispatch = DispatchValidationTests()
+        dispatch.setUp()
+        self.addCleanup(dispatch.tearDown)
+        budget = {
+            "authorization_id": self.budget.authorization_id, "max_calls": 1,
+            "max_resume_dispatches": 1, "cost_ceiling_usd": 0.0,
+            "provider": "local", "model": ae.LOCAL_QWEN_MODEL,
+            "model_revision": ae.LOCAL_QWEN_REVISION, "model_sha256": ae.LOCAL_QWEN_SHA256,
+        }
+        dispatch.payload["control_tower_decision_budget"] = budget
+        dispatch.write_manifest()
+        digest = "d" * 64
+        decision_id = ae.control_tower_decision_id(task_id="ADOS-POC-999",
+            blocker_sha256=digest, authorization_id=self.budget.authorization_id)
+        source_claim = f"<!-- ADOS_DISPATCH_CLAIM task=ADOS-POC-999 event={'e' * 64} run=700 -->"
+        ct_comments = [
+            {"body": source_claim, "user_login": "github-actions[bot]"},
+            *[{"body": ae.control_tower_marker(kind, task_id="ADOS-POC-999",
+                decision_id=decision_id, blocker_sha256=digest,
+                authorization_id=self.budget.authorization_id, source_run_id=700,
+                workflow_run_id=800), "user_login": "github-actions[bot]"}
+              for kind in ("CONSUMED", "DECISION", "RESUME")],
+        ]
+        run = {"repository": "chinkk-git/aaria-ados-poc", "head_branch": "main",
+               "head_sha": dispatch.trusted_revision_sha}
+        runs = {
+            "700": {**run, "id": 700, "workflow_path": ".github/workflows/ados-dispatch.yml", "event": "issues"},
+            "800": {**run, "id": 800, "workflow_path": ".github/workflows/ados-control-tower.yml", "event": "workflow_run"},
+        }
+        ledger = dispatch.root / "ledger.json"
+        ledger.write_text(json.dumps({"comments": ct_comments, "runs": runs}))
+        args = ["--issue", "999", "--actor", "chinkk-git", "--repository", "chinkk-git/aaria-ados-poc",
+            "--trusted-revision-sha", dispatch.trusted_revision_sha,
+            "--workflow-sha", dispatch.trusted_revision_sha,
+            "--current-main-sha", dispatch.trusted_revision_sha,
+            "--manifest-parent-sha", dispatch.sha, "--created-at", "2026-01-01T00:00:00Z",
+            "--action", "control-tower-resume", "--comments-json", str(ledger),
+            "--run-id", "900", "--run-attempt", "1", "--resume-decision-id", decision_id,
+            "--repository-root", str(dispatch.root)]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(ae.validate_dispatch_cli(args), 0)
+        self.assertTrue(json.loads(output.getvalue())["authorized_resume"])
+        replay_claim = f"<!-- ADOS_DISPATCH_CLAIM task=ADOS-POC-999 event={decision_id} run=900 -->"
+        replay_started = f"<!-- ADOS_DISPATCH_PROVIDER_STARTED task=ADOS-POC-999 event={decision_id} run=900 -->"
+        ct_comments.extend([
+            {"body": replay_claim, "user_login": "github-actions[bot]"},
+            {"body": replay_started, "user_login": "github-actions[bot]"},
+        ])
+        runs["900"] = {**run, "id": 900, "workflow_path": ".github/workflows/ados-dispatch.yml", "event": "repository_dispatch"}
+        ledger.write_text(json.dumps({"comments": ct_comments, "runs": runs}))
+        with self.assertRaisesRegex(ae.DuplicateExecution, "control_tower_resume_event_already_claimed"):
+            ae.validate_dispatch_cli(args)
 
 
 if __name__ == "__main__":

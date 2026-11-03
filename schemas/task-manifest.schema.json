@@ -5,41 +5,159 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "issue_number", "authorized_actors", "repository", "task_id", "branch",
-    "expected_base_sha", "permitted_paths", "task_prompt", "acceptance_criteria",
-    "cost_ceiling_usd", "provider", "provider_model", "provider_model_revision", "provider_model_sha256", "inference_authorization_id", "max_provider_calls", "max_workflow_recoveries", "enabled"
+    "issue_number",
+    "authorized_actors",
+    "repository",
+    "task_id",
+    "branch",
+    "expected_base_sha",
+    "permitted_paths",
+    "task_prompt",
+    "acceptance_criteria",
+    "cost_ceiling_usd",
+    "provider",
+    "provider_model",
+    "provider_model_revision",
+    "provider_model_sha256",
+    "inference_authorization_id",
+    "max_provider_calls",
+    "max_workflow_recoveries",
+    "enabled",
+    "control_tower_decision_budget"
   ],
   "properties": {
-    "issue_number": {"type": "integer", "minimum": 1},
-    "authorized_actors": {
-      "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true,
-      "items": {"type": "string", "pattern": "^[A-Za-z0-9-]{1,39}$"}
+    "issue_number": {
+      "type": "integer",
+      "minimum": 1
     },
-    "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
-    "task_id": {"type": "string", "pattern": "^ADOS-POC-[0-9]{3}$"},
-    "branch": {"type": "string", "pattern": "^(feature|experiment)/[a-z0-9][a-z0-9._/-]*$"},
+    "authorized_actors": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9-]{1,39}$"
+      }
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^ADOS-POC-[0-9]{3}$"
+    },
+    "branch": {
+      "type": "string",
+      "pattern": "^(feature|experiment)/[a-z0-9][a-z0-9._/-]*$"
+    },
     "expected_base_sha": {
       "type": "string",
       "pattern": "^[0-9a-f]{40}$",
       "description": "Expected first parent of the trusted main revision that contains this manifest. The containing revision itself is derived from the triggering workflow SHA and is the task branch base."
     },
     "permitted_paths": {
-      "type": "array", "minItems": 1, "uniqueItems": true,
-      "items": {"type": "string", "minLength": 1}
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
-    "task_prompt": {"type": "string", "minLength": 1, "maxLength": 12000},
+    "task_prompt": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 12000
+    },
     "acceptance_criteria": {
-      "type": "array", "minItems": 1, "uniqueItems": true,
-      "items": {"type": "string", "minLength": 1, "maxLength": 1000}
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000
+      }
     },
-    "cost_ceiling_usd": {"const": 0.0},
-    "provider": {"const": "local"},
-    "provider_model": {"const": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"},
-    "provider_model_revision": {"const": "f86cb2c1fa58255f8052cc32aeede1b7482d4361"},
-    "provider_model_sha256": {"const": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046"},
-    "inference_authorization_id": {"type": ["string", "null"], "pattern": "^AUTH-[A-Z0-9-]{1,64}$"},
-    "max_provider_calls": {"const": 1},
-    "max_workflow_recoveries": {"type": "integer", "minimum": 0, "maximum": 3},
-    "enabled": {"type": "boolean"}
+    "cost_ceiling_usd": {
+      "const": 0
+    },
+    "provider": {
+      "const": "local"
+    },
+    "provider_model": {
+      "const": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
+    },
+    "provider_model_revision": {
+      "const": "f86cb2c1fa58255f8052cc32aeede1b7482d4361"
+    },
+    "provider_model_sha256": {
+      "const": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046"
+    },
+    "inference_authorization_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^AUTH-[A-Z0-9-]{1,64}$"
+    },
+    "max_provider_calls": {
+      "const": 1
+    },
+    "max_workflow_recoveries": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "control_tower_decision_budget": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "description": "Separate one-call, zero-cost Qwen reasoning allowance. Null or absent means no Control Tower inference authorization.",
+      "required": [
+        "authorization_id",
+        "max_calls",
+        "max_resume_dispatches",
+        "cost_ceiling_usd",
+        "provider",
+        "model",
+        "model_revision",
+        "model_sha256"
+      ],
+      "properties": {
+        "authorization_id": {
+          "type": "string",
+          "pattern": "^AUTH-[A-Z0-9-]{1,64}$"
+        },
+        "max_calls": {
+          "const": 1
+        },
+        "max_resume_dispatches": {
+          "const": 1
+        },
+        "cost_ceiling_usd": {
+          "const": 0
+        },
+        "provider": {
+          "const": "local"
+        },
+        "model": {
+          "const": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
+        },
+        "model_revision": {
+          "const": "f86cb2c1fa58255f8052cc32aeede1b7482d4361"
+        },
+        "model_sha256": {
+          "const": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046"
+        }
+      }
+    }
   }
 }

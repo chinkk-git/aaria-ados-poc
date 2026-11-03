@@ -3,6 +3,12 @@ on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
+    inputs:
+      check_openrouter_quota:
+        description: Read documented free-model daily request allowance (no model request)
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -52,7 +58,12 @@ jobs:
               exact=[r for r in runs if r.get('event')=='issues' and r.get('display_title')==identity]
               linked=[p for p in prs if p.get('head',{}).get('ref')=='feature/ados-poc-002']
               age=(now-datetime.datetime.fromisoformat(issue['created_at'].replace('Z','+00:00'))).total_seconds()/60
-              if len(exact)>1:
+              issue_lines=(issue.get('body') or '').splitlines()
+              task_state=next((line.removeprefix('<!-- ADOS_TASK_STATE: ').removesuffix(' -->') for line in issue_lines if line.startswith('<!-- ADOS_TASK_STATE: ')), 'UNKNOWN')
+              last_success=next((line.removeprefix('<!-- ADOS_LAST_SUCCESSFUL_STEP: ').removesuffix(' -->') for line in issue_lines if line.startswith('<!-- ADOS_LAST_SUCCESSFUL_STEP: ')), 'UNKNOWN')
+              if task_state=='BLOCKED_QUOTA':
+                  status='BLOCKED_QUOTA'
+              elif len(exact)>1:
                   status='AMBIGUOUS_DUPLICATE_RUNS'
               elif len(exact)==1:
                   run=exact[0]
@@ -66,11 +77,12 @@ jobs:
                   status='LEGACY_UNCORRELATED_PR_PRESENT'
               else:
                   status='UNVERIFIED_DISPATCH' if age<20 else 'BLOCKED_MISSING_CORRELATED_RUN'
-              record={'task':'ADOS-POC-002','issue':issue_id,'run_id':exact[0]['id'] if len(exact)==1 else None,
+              record={'task':'ADOS-POC-002','issue':issue_id,'task_state':task_state,'run_id':exact[0]['id'] if len(exact)==1 else None,
                 'run_conclusion':exact[0].get('conclusion') if len(exact)==1 else None,
                 'run_head_sha':exact[0].get('head_sha') if len(exact)==1 else None,
                 'branch_head_sha':branches['feature/ados-poc-002']['commit']['sha'],
                 'linked_prs':[p['number'] for p in linked],
+                'last_successful_step':last_success,
                 'status':status,'observed_at':now.isoformat(),
                 'next_action':'REVIEW_EVIDENCE_ONLY; no automatic retries or writes'}
               records.append(record)
@@ -84,6 +96,120 @@ jobs:
               for r in records:
                   summary.write('- Issue #'+str(r['issue'])+': **'+r['status']+'**; run='+str(r['run_id'])+'; branch='+r['branch_head_sha']+'\n')
               summary.write('\nNo automated retries, PR creation, merges or writes.\n')
+          PY
+      - name: Assess free-model quota without an AI request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime, json, os, pathlib, urllib.request, urllib.error
+          path = pathlib.Path('ados-supervisor-checkpoint.json')
+          report = json.loads(path.read_text())
+          now = datetime.datetime.now(datetime.timezone.utc)
+          quota = {
+            'state': 'UNKNOWN',
+            'remaining_requests': None,
+            'reset_at': None,
+            'evidence': 'No authoritative remaining free-request counter available',
+            'observed_at': now.isoformat(),
+            'model_requests_made': 0
+          }
+          # Read-only inspection of recent dispatcher conclusions. A workflow
+          # failure alone is not proof of rate limiting or quota exhaustion.
+          req = urllib.request.Request(
+            'https://api.github.com/repos/' + os.environ['GH_REPO'] +
+            '/actions/workflows/ados-poc-002.yml/runs?per_page=20',
+            headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                     'Accept': 'application/vnd.github+json',
+                     'X-GitHub-Api-Version': '2022-11-28'})
+          try:
+              with urllib.request.urlopen(req, timeout=15) as response:
+                  runs = json.load(response).get('workflow_runs', [])
+              quota['recent_dispatch_runs'] = [
+                  {'id': r['id'], 'status': r.get('status'),
+                   'conclusion': r.get('conclusion')} for r in runs[:5]
+              ]
+          except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+              quota['evidence'] = 'Could not read dispatcher history: ' + type(exc).__name__
+          report['openrouter_quota'] = quota
+          path.write_text(json.dumps(report, indent=2) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('\n### OpenRouter free-model quota\n')
+              summary.write('- Status: **UNKNOWN** (fail-closed; no AI calls)\n')
+              summary.write('- Remaining requests: **not verifiable**\n')
+              summary.write('- No paid fallback or automatic restart.\n')
+          PY
+      - name: Read documented free-model daily quota (manual opt-in; no model request)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_openrouter_quota }}
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime, json, os, pathlib, urllib.request, urllib.error
+          path = pathlib.Path('ados-supervisor-checkpoint.json')
+          report = json.loads(path.read_text(encoding='utf-8'))
+          now = datetime.datetime.now(datetime.timezone.utc)
+          quota = {
+              'state': 'QUOTA_UNKNOWN',
+              'remaining_requests': None,
+              'limit_requests': None,
+              'used_requests': None,
+              'reset_at': None,
+              'source': 'OpenRouter GET /api/v1/key documented data.free_model_daily_requests',
+              'observed_at': now.isoformat(),
+              'model_requests_made': 0
+          }
+          key = os.environ.get('OPENROUTER_API_KEY', '')
+          if not key:
+              quota['evidence'] = 'API key secret unavailable; no quota value read'
+          else:
+              request = urllib.request.Request(
+                  'https://openrouter.ai/api/v1/key',
+                  headers={'Authorization': 'Bearer ' + key,
+                           'Accept': 'application/json'},
+                  method='GET')
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      payload = json.load(response)
+                  data = payload.get('data') if isinstance(payload, dict) else None
+                  free = data.get('free_model_daily_requests') if isinstance(data, dict) else None
+                  if not isinstance(free, dict):
+                      quota['evidence'] = 'Documented quota field missing; remaining count unknown'
+                  else:
+                      values = {name: free.get(name) for name in ('remaining', 'limit', 'used')}
+                      valid = all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                                  for value in values.values())
+                      if valid and values['remaining'] <= values['limit']:
+                          quota.update({
+                              'state': 'AVAILABLE' if values['remaining'] > 0 else 'DAILY_LIMIT_REACHED',
+                              'remaining_requests': values['remaining'],
+                              'limit_requests': values['limit'],
+                              'used_requests': values['used'],
+                              'evidence': 'Documented free_model_daily_requests field'
+                          })
+                      else:
+                          quota['evidence'] = 'Documented quota field was malformed; remaining count unknown'
+              except urllib.error.HTTPError as error:
+                  quota['http_status'] = error.code
+                  quota['evidence'] = 'OpenRouter returned an HTTP error; response body suppressed'
+              except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+                  quota['evidence'] = 'Quota metadata request failed; response details suppressed'
+          report['openrouter_quota'] = quota
+          path.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('\n### OpenRouter free-model daily request allowance\n')
+              summary.write('- State: **' + quota['state'] + '**\n')
+              summary.write('- Remaining requests: **' + str(quota['remaining_requests']) + '**\n')
+              summary.write('- Reset time: **unknown/not returned by this check**\n')
+              summary.write('- No model request was made.\n')
+          print(json.dumps({key: quota[key] for key in
+                            ('state', 'remaining_requests', 'limit_requests', 'used_requests',
+                             'http_status', 'evidence') if key in quota}, sort_keys=True))
           PY
       - name: Save immutable monitoring evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
